@@ -203,11 +203,6 @@ export type {
 
 // Bots service — IBotsService is both a type (interface) and value (descriptor).
 export { IBotsService } from "./bots/bots.js";
-export { handleWebhookBotCallback, parseWebhookCallbackBody } from "./bots/webhookCallbackHttp.js";
-export type {
-  WebhookBotCallbackBotsService,
-  WebhookBotCallbackResult,
-} from "./bots/webhookCallbackHttp.js";
 export type {
   BotRemoteWorkspaceResolver,
   BotRemoteWorkspaceResolution,

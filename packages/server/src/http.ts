@@ -25,9 +25,9 @@ import {
   createZCodeAgentConnectionScope,
   IBotsService,
   IProviderProvisioningTargetService,
-  handleWebhookBotCallback,
 } from "@zcode/services";
 import {
+  botProviders,
   formatLogPrefix,
   serverRemoteInfoOutputSchema,
   SERVER_REMOTE_PROTOCOL_VERSION,
@@ -401,16 +401,47 @@ export function createHttpServer(
   app.get("/ws/host", upgradeTrustedHostWebSocket);
 
   const handleBotCallback = async (c: Context) => {
-    // 解析、provider 校验与状态映射收口在 services 的共享实现；Web 与桌面入口不得各自复制。
+    const provider = c.req.param("provider") as BotProvider;
+    if (!botProviders.includes(provider)) {
+      return c.json({ error: `Unsupported provider: ${provider}` }, 400);
+    }
+    if (provider !== "webhook") {
+      return c.json({ error: `Provider ${provider} does not support HTTP callbacks.` }, 400);
+    }
+    const botsService = services.getOptional(IBotsService);
+    if (!botsService) {
+      return c.json({ error: "Bots service is not available." }, 503);
+    }
     const rawBodyText = await c.req.text().catch(() => "");
-    const result = await handleWebhookBotCallback({
-      provider: c.req.param("provider") as BotProvider,
-      botId: c.req.param("botId"),
-      rawBodyText,
-      webhookSecret: c.req.header("x-zcode-bot-secret") ?? undefined,
-      botsService: services.getOptional(IBotsService),
+    let rawBody: unknown = {};
+    if (rawBodyText) {
+      try {
+        rawBody = JSON.parse(rawBodyText) as unknown;
+      } catch {
+        rawBody = { payload: rawBodyText };
+      }
+    }
+    const webhookSecret = c.req.header("x-zcode-bot-secret");
+    const botId = c.req.param("botId");
+    const result = await botsService.handleProviderCallbackResponse(provider, {
+      ...(typeof rawBody === "object" && rawBody !== null ? rawBody : { payload: rawBody }),
+      rawBody: rawBodyText,
+      ...(botId ? { botId } : {}),
+      ...(webhookSecret ? { webhookSecret } : {}),
     });
-    return c.json(result.body, result.status);
+    const responseBody = result.responseBody ?? { ok: result.ok, replies: result.replies };
+    if (result.status === 400) {
+      return c.json(responseBody, 400);
+    }
+    if (result.status === 401) {
+      return c.json(responseBody, 401);
+    }
+    if (result.status === 503) {
+      // Bugfix：Bot 业务失败必须把可重试状态透传给 HTTP provider；返回 200 会让
+      // webhook/网关误以为消息已消费，效果与提前提交 Telegram offset 相同。
+      return c.json(responseBody, 503);
+    }
+    return c.json(responseBody, 200);
   };
 
   app.post("/api/bots/:provider", handleBotCallback);

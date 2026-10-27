@@ -114,7 +114,6 @@ export function BotsDialog({
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [credentialValue, setCredentialValue] = useState("");
   const [secretSaving, setSecretSaving] = useState(false);
-  const [webhookUrlDraft, setWebhookUrlDraft] = useState("");
   const [workspaceAccessSaving, setWorkspaceAccessSaving] = useState(false);
   const [botNameDraft, setBotNameDraft] = useState<{
     botId: string;
@@ -150,11 +149,6 @@ export function BotsDialog({
     const timer = window.setInterval(() => setNowMs(Date.now()), 250);
     return () => window.clearInterval(timer);
   }, [bindCode, open]);
-
-  // webhook 草稿跟随选中 bot：切换/刷新后回到已保存值，避免把 A bot 的 URL 写进 B bot。
-  useEffect(() => {
-    setWebhookUrlDraft(selectedBot?.webhookUrl ?? "");
-  }, [selectedBot?.id, selectedBot?.webhookUrl]);
 
   useEffect(() => {
     if (!open || !bindCode || bindExpired) return undefined;
@@ -304,11 +298,10 @@ export function BotsDialog({
   }, [entryProvider, open]);
 
   const saveBot = useCallback(
-    async (bot: BotConfig, secrets?: { credentialValue?: string; webhookSecretValue?: string }) => {
+    async (bot: BotConfig, secrets?: { credentialValue?: string }) => {
       const saved = await botsService.saveBot({
         bot,
         credentialValue: secrets?.credentialValue,
-        webhookSecretValue: secrets?.webhookSecretValue,
       });
       setConfig((previous) => ({
         ...previous,
@@ -746,28 +739,6 @@ export function BotsDialog({
     }
   };
 
-  const handleSaveWebhookUrl = useCallback(async () => {
-    if (!selectedBot) return;
-    // 空串存为 undefined：BotConfig.webhookUrl 是可选 URL 字段，空串过不了 schema。
-    await patchSelectedBot({ webhookUrl: webhookUrlDraft.trim() || undefined });
-  }, [patchSelectedBot, selectedBot, webhookUrlDraft]);
-
-  const handleSaveWebhookSecret = useCallback(async () => {
-    if (!selectedBot || secretSaving) return;
-    setSecretSaving(true);
-    try {
-      // webhook 的入站密钥走 webhookSecretValue（存 webhookSecretRef），
-      // 与凭据 credentialValue 的存储 ref 不同，不能用同一个保存路径。
-      await saveBot(selectedBot, { webhookSecretValue: credentialValue });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error("[BotsDialog] 保存 Webhook secret 失败", message);
-      toast(intl.formatMessage({ id: "bots.saveFailed" }, { error: message }));
-    } finally {
-      setSecretSaving(false);
-    }
-  }, [credentialValue, intl, saveBot, secretSaving, selectedBot]);
-
   const handleStartFeishuRegistration = useCallback(async () => {
     if (!selectedBot || !isFeishuBotProvider(selectedBot.provider)) return;
     setFeishuRegistrationLoading(true);
@@ -1135,7 +1106,7 @@ export function BotsDialog({
                   </p>
                 </div>
                 <div className="grid gap-3 md:grid-cols-2">
-                  {BOT_PROVIDERS.map((provider) => {
+                  {BOT_PROVIDERS.filter((provider) => provider.id !== "webhook").map((provider) => {
                     const implemented = provider.implemented;
                     const isCreatingThisProvider = creatingProvider === provider.id;
                     const isCreatingAnyProvider = creatingProvider !== null;
@@ -1219,8 +1190,6 @@ export function BotsDialog({
                   bot={selectedBot}
                   runtime={selectedRuntime}
                   credentialValue={credentialValue}
-                  webhookUrlDraft={webhookUrlDraft}
-                  onWebhookUrlDraftChange={setWebhookUrlDraft}
                   bindCode={bindCode}
                   bindExpired={bindExpired}
                   bindRemainingMs={bindRemainingMs}
@@ -1233,8 +1202,6 @@ export function BotsDialog({
                   secretSaving={secretSaving}
                   onCredentialValueChange={setCredentialValue}
                   onSaveSecret={() => void handleSaveSecret()}
-                  onSaveWebhookUrl={() => void handleSaveWebhookUrl()}
-                  onSaveWebhookSecret={() => void handleSaveWebhookSecret()}
                   onRemoveSecret={() => void handleRemoveSecret()}
                   onOpenTelegramBotFather={handleOpenTelegramBotFather}
                   onStartWeixinRegistration={() => void handleStartWeixinRegistration()}

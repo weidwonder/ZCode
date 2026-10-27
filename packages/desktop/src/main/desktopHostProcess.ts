@@ -54,7 +54,6 @@ import { createHostLogRelay } from "./hostLogRelay.js";
 import { ingestCliResourceSample } from "./processResourceCliSource.js";
 import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
 import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
-import { resolveBotWebhookIngressResult } from "./botWebhookIngress.js";
 import {
   registerHostAgentProcess,
   registerHostProcess,
@@ -339,11 +338,6 @@ export function spawnHostProcess(
 
     if (result.data.type === HostResponseTypes.ResourceUsageSnapshotResult) {
       resolveHostResourceUsageResult(label, result.data);
-      return;
-    }
-
-    if (result.data.type === HostResponseTypes.BotWebhookIngressResult) {
-      resolveBotWebhookIngressResult(result.data);
       return;
     }
 

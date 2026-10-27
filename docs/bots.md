@@ -251,8 +251,6 @@ POST /api/bots/webhook
 
 The service, RPC service, HTTP route, persisted data, and UI all use the Bots naming.
 
-The desktop app serves the same inbound semantics on an opt-in loopback endpoint; see [Desktop local webhook bot ingress](./bot-webhook-ingress.md).
-
 ### Feishu reply delivery diagnostics (ZCT-2096089929570893824)
 
 - Only private inbound messages may create or advance tasks; group messages retain the existing private-chat-only response. Private delivery uses `open_id`; no speculative `chat_id` fallback or new retries.

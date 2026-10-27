@@ -1180,13 +1180,6 @@ const enUS: Record<string, string> = {
   "bots.newBot.providerDescription.dingding": "DingTalk bot integration is planned.",
   "bots.newBot.providerDescription.webhook":
     "Receive callbacks from your own system and optionally push replies back.",
-  "bots.webhookUrl.label": "Webhook URL",
-  "bots.webhookUrl.description":
-    "Where ZCode posts bot replies; leave empty to only receive inbound callbacks.",
-  "bots.webhookSecret.label": "Inbound secret",
-  "bots.webhookSecret.description":
-    "Secret that inbound requests must carry in the x-zcode-bot-secret header; the value is never shown again after saving.",
-  "bots.webhookSecret.saved": "Saved",
   "bots.newBot.providerDescription.discord": "Discord bot integration is planned.",
   "bots.newBot.providerDescription.wecom": "WeCom bot integration is planned.",
   "bots.empty": "No bots configured.",
