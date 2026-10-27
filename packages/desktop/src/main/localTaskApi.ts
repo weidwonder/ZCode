@@ -4,7 +4,7 @@
  * 依赖全部注入以便单测。 */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAppConfigDir } from "@zcode/services/node";
 import { HostMessageTypes, type LocalTaskApiRequestOp } from "@zcode/shared";
@@ -16,6 +16,16 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MIN_TOKEN_CHARS = 32;
 /** dispatcher 兜底超时（events 的 waitMs 上限 30s 远小于此）。 */
 const DISPATCH_TIMEOUT_MS = 300_000;
+
+/** 与 ZCodeTaskMode 全集对齐（packages/shared/src/zcode-task-types-core.ts 的 ZCodeTaskMode）；上游加值时这里同步，否则 400。 */
+const TASK_MODES = new Set([
+  "default", "yolo", "guarded", "plan", "edit", "acceptEdits",
+  "auto", "dontAsk", "bypassPermissions", "autoEdit", "build",
+] as const);
+type TaskModeValue = Parameters<typeof TASK_MODES.has>[0];
+
+/** clientRequestId 幂等窗口：TTL 内同 id 重复 create 直接回已有 taskId，不再 dispatch。 */
+const CLIENT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
 
 export interface LocalTaskApiConfig {
   enabled: boolean;
@@ -66,11 +76,13 @@ export interface LocalTaskApiDispatcherDeps {
   /** 按本地 workspacePath 找拥有它的窗口 Host；找不到返回 null。 */
   resolveHost: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
   timeoutMs?: number;
+  logger?: { warn: (...args: unknown[]) => void };
 }
 
 interface PendingLocalTaskApiRequest {
   resolve: (result: { status: number; body: unknown }) => void;
   timer: ReturnType<typeof setTimeout>;
+  host: { postMessage: (message: unknown) => void };
 }
 
 export function createLocalTaskApiDispatcher(deps: LocalTaskApiDispatcherDeps) {
@@ -99,16 +111,22 @@ export function createLocalTaskApiDispatcher(deps: LocalTaskApiDispatcherDeps) {
     return await new Promise<{ status: number; body: unknown }>((resolve) => {
       const timer = setTimeout(() => {
         pending.delete(requestId);
+        deps.logger?.warn(
+          `[local-task-api] dispatch failed request=${requestId} reason=timeout`,
+        );
         resolve({ status: 503, body: { error: "unavailable_host" } });
       }, timeoutMs);
       // 不靠这条兜底定时器维持进程存活；窗口 Host 应答/断开自有其它存活来源。
       timer.unref?.();
-      pending.set(requestId, { resolve, timer });
+      pending.set(requestId, { resolve, timer, host });
       try {
         host.postMessage({ type: HostMessageTypes.LocalTaskApiRequest, requestId, op });
       } catch {
         pending.delete(requestId);
         clearTimeout(timer);
+        deps.logger?.warn(
+          `[local-task-api] dispatch failed request=${requestId} reason=post_error`,
+        );
         resolve({ status: 503, body: { error: "unavailable_host" } });
       }
     });
@@ -126,6 +144,9 @@ export function createLocalTaskApiDispatcher(deps: LocalTaskApiDispatcherDeps) {
     if (message.ok) {
       settle(message.requestId, { status: message.status, body: message.body });
     } else {
+      deps.logger?.warn(
+        `[local-task-api] dispatch failed request=${message.requestId} reason=host_error`,
+      );
       settle(message.requestId, {
         status: 503,
         body: message.body ?? { error: "unavailable_host" },
@@ -133,11 +154,32 @@ export function createLocalTaskApiDispatcher(deps: LocalTaskApiDispatcherDeps) {
     }
   }
 
-  return { dispatch, resolveLocalTaskApiResponse };
+  /** Host 退出时结清属于它的在飞请求（含 events 长轮询），返回结清条数。 */
+  function settleRequestsForHost(host: unknown): number {
+    const matched: string[] = [];
+    for (const [requestId, entry] of pending) {
+      if (entry.host === host) {
+        matched.push(requestId);
+      }
+    }
+    for (const requestId of matched) {
+      settle(requestId, { status: 503, body: { error: "unavailable_host" } });
+    }
+    if (matched.length > 0) {
+      deps.logger?.warn(
+        `[local-task-api] host exited; settled ${matched.length} in-flight request(s)`,
+      );
+    }
+    return matched.length;
+  }
+
+  return { dispatch, resolveLocalTaskApiResponse, settleRequestsForHost };
 }
 
 export interface LocalTaskApiDeps {
   readConfig?: () => Promise<LocalTaskApiConfig | null | "invalid">;
+  /** 开关文件绝对路径；权限检查 stat 用。缺省为 getAppConfigDir() 下的默认文件。 */
+  configPath?: string;
   resolveHost: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
   zcodeVersion: string;
   logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
@@ -152,11 +194,16 @@ export interface LocalTaskApiDeps {
  * 是预期行为。
  */
 export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server | null> {
-  const dispatcher = createLocalTaskApiDispatcher({ resolveHost: deps.resolveHost });
+  const dispatcher = createLocalTaskApiDispatcher({
+    resolveHost: deps.resolveHost,
+    logger: deps.logger,
+  });
   setLocalTaskApiDispatcher(dispatcher);
 
   const taskWorkspaceByTaskId = new Map<string, string>();
-  // 拒绝计数：仅内存聚合，供未来暴露；本版不输出，避免逐请求日志泄漏路径或内容。
+  // clientRequestId 幂等表：TTL 内同 id 重复 create 直接回已有 taskId（不透传 Host）。
+  const createdTaskByClientRequestId = new Map<string, { taskId: string; expiresAt: number }>();
+  // 拒绝计数：仅内存聚合；每次自增输出一行 warn（只含键名与新值，不含路径与请求内容）。
   const rejected = {
     unauthorized: 0,
     hostForbidden: 0,
@@ -166,6 +213,10 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     taskNotFound: 0,
     unavailable: 0,
   };
+  function noteReject(key: keyof typeof rejected): void {
+    rejected[key] += 1;
+    deps.logger.warn(`[local-task-api] rejected ${key} count=${rejected[key]}`);
+  }
 
   const readConfig = deps.readConfig ?? readLocalTaskApiConfig;
   const config = await readConfig();
@@ -178,6 +229,19 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
   }
   const port = config.port;
   const tokenDigest = createHash("sha256").update(config.token).digest();
+
+  // 权限提醒：token 若对本机其他用户可读则控制权外泄；只 warn 不拒绝（拍板④）。
+  try {
+    const configPath = deps.configPath ?? join(getAppConfigDir(), LOCAL_TASK_API_CONFIG_FILE);
+    const st = await stat(configPath);
+    if (st.mode & 0o077) {
+      deps.logger.warn(
+        `[local-task-api] ${LOCAL_TASK_API_CONFIG_FILE} is readable by group/others; recommend chmod 600`,
+      );
+    }
+  } catch {
+    // stat 失败不阻断（readConfig 可能是注入的实现，没有真实文件）。
+  }
 
   function isAuthorized(req: IncomingMessage): boolean {
     const header = req.headers["authorization"];
@@ -275,7 +339,7 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     // 归属表未命中但请求带了 workspacePath：按它路由，由 Host 校验任务归属；
     // 应答 2xx 时回填归属表（调用方在 dispatch 后做）。
     if (typeof provided === "string" && provided.length > 0) return provided;
-    rejected.taskNotFound += 1;
+    noteReject("taskNotFound");
     sendJson(res, 404, { error: "task_not_found" });
     return null;
   }
@@ -289,7 +353,10 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     try {
       const result = await dispatcher.dispatch(workspacePath, op);
       if (result.status === 409) {
-        rejected.workspaceNotOpen += 1;
+        noteReject("workspaceNotOpen");
+      }
+      if (result.status === 503) {
+        noteReject("unavailable");
       }
       // Host 校验通过（2xx）才回填：外部提供的 workspacePath 从此成为权威归属。
       if (options?.rememberTask && result.status >= 200 && result.status < 300) {
@@ -297,7 +364,7 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       }
       sendJson(res, result.status, result.body);
     } catch {
-      rejected.unavailable += 1;
+      noteReject("unavailable");
       sendJson(res, 503, { error: "unavailable_host" });
     }
   }
@@ -323,12 +390,12 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
 
     if (segments.length === 2 && segments[0] === "api" && segments[1] === "tasks") {
       if (!isAllowedHostHeader(req)) {
-        rejected.hostForbidden += 1;
+        noteReject("hostForbidden");
         sendJson(res, 403, { error: "host_header_forbidden" });
         return;
       }
       if (!isAuthorized(req)) {
-        rejected.unauthorized += 1;
+        noteReject("unauthorized");
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -353,12 +420,12 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         return;
       }
       if (!isAllowedHostHeader(req)) {
-        rejected.hostForbidden += 1;
+        noteReject("hostForbidden");
         sendJson(res, 403, { error: "host_header_forbidden" });
         return;
       }
       if (!isAuthorized(req)) {
-        rejected.unauthorized += 1;
+        noteReject("unauthorized");
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -384,12 +451,12 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         return;
       }
       if (!isAllowedHostHeader(req)) {
-        rejected.hostForbidden += 1;
+        noteReject("hostForbidden");
         sendJson(res, 403, { error: "host_header_forbidden" });
         return;
       }
       if (!isAuthorized(req)) {
-        rejected.unauthorized += 1;
+        noteReject("unauthorized");
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -433,31 +500,31 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
 
     // 统一顺序：Host 头校验 → 鉴权 → Content-Type → body。
     if (!isAllowedHostHeader(req)) {
-      rejected.hostForbidden += 1;
+      noteReject("hostForbidden");
       sendJson(res, 403, { error: "host_header_forbidden" });
       return;
     }
     if (!isAuthorized(req)) {
-      rejected.unauthorized += 1;
+      noteReject("unauthorized");
       sendJson(res, 401, { error: "unauthorized" });
       return;
     }
     const contentType = req.headers["content-type"];
     if (contentType !== undefined) {
       if (!contentType.toLowerCase().includes("application/json")) {
-        rejected.unsupportedMedia += 1;
+        noteReject("unsupportedMedia");
         sendJson(res, 415, { error: "unsupported_media_type" });
         return;
       }
     } else if (hasDeclaredBody(req)) {
-      rejected.unsupportedMedia += 1;
+      noteReject("unsupportedMedia");
       sendJson(res, 415, { error: "unsupported_media_type" });
       return;
     }
     const body = await readRequestBody(req);
     if (!body.ok) {
       if (body.tooLarge) {
-        rejected.tooLarge += 1;
+        noteReject("tooLarge");
         sendJson(res, 413, { error: "payload_too_large" });
         res.once("finish", () => req.destroy());
         return;
@@ -482,33 +549,78 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       const prompt = parsed["prompt"];
       const mode = parsed["mode"];
       const title = parsed["title"];
+      const clientRequestId = parsed["clientRequestId"];
       if (
         typeof workspacePath !== "string" ||
         workspacePath.length === 0 ||
         typeof prompt !== "string" ||
-        (mode !== undefined && typeof mode !== "string") ||
+        // mode 若存在必须是 TASK_MODES 全集内的值：放行未知值会被 Host 侧 shared schema
+        // 拒绝且不应答，请求只能等 300s 兜底，所以这里先 400。
+        (mode !== undefined && !(typeof mode === "string" && TASK_MODES.has(mode as never))) ||
         (title !== undefined && typeof title !== "string")
       ) {
         sendJson(res, 400, { error: "bad_request" });
         return;
       }
+      let normalizedClientRequestId: string | null = null;
+      if (clientRequestId !== undefined) {
+        if (
+          typeof clientRequestId !== "string" ||
+          clientRequestId.length < 1 ||
+          clientRequestId.length > 200
+        ) {
+          sendJson(res, 400, { error: "bad_request" });
+          return;
+        }
+        normalizedClientRequestId = clientRequestId;
+      }
+      // clientRequestId 幂等：body 校验通过后先惰性清过期项，命中未过期直接回已有 taskId。
+      if (normalizedClientRequestId !== null) {
+        const now = Date.now();
+        for (const [key, value] of createdTaskByClientRequestId) {
+          if (value.expiresAt < now) {
+            createdTaskByClientRequestId.delete(key);
+          }
+        }
+        const hit = createdTaskByClientRequestId.get(normalizedClientRequestId);
+        if (hit) {
+          deps.logger.info(
+            `[local-task-api] duplicate create request=${normalizedClientRequestId} task=${hit.taskId}`,
+          );
+          sendJson(res, 201, { taskId: hit.taskId });
+          return;
+        }
+      }
       const op: LocalTaskApiRequestOp = {
         kind: "create",
         workspacePath,
         prompt,
-        ...(typeof mode === "string" ? { mode } : {}),
+        ...(typeof mode === "string" && TASK_MODES.has(mode as never)
+          ? { mode: mode as TaskModeValue }
+          : {}),
         ...(typeof title === "string" ? { title } : {}),
       };
       const result = await dispatcher.dispatch(workspacePath, op);
       if (result.status === 409) {
-        rejected.workspaceNotOpen += 1;
+        noteReject("workspaceNotOpen");
       }
-      if (
-        result.status === 201 &&
-        isRecord(result.body) &&
-        typeof result.body["taskId"] === "string"
-      ) {
-        taskWorkspaceByTaskId.set(result.body["taskId"], workspacePath);
+      if (result.status === 503) {
+        noteReject("unavailable");
+      }
+      // Host 侧部分失败会以 2xx + warning 应答，只要 body 形如 {taskId} 就登记。
+      const createdTaskId =
+        isRecord(result.body) && typeof result.body["taskId"] === "string"
+          ? result.body["taskId"]
+          : null;
+      if (result.status >= 200 && result.status < 300 && createdTaskId !== null) {
+        taskWorkspaceByTaskId.set(createdTaskId, workspacePath);
+        deps.logger.info(`[local-task-api] created task=${createdTaskId}`);
+        if (normalizedClientRequestId !== null) {
+          createdTaskByClientRequestId.set(normalizedClientRequestId, {
+            taskId: createdTaskId,
+            expiresAt: Date.now() + CLIENT_REQUEST_ID_TTL_MS,
+          });
+        }
       }
       sendJson(res, result.status, result.body);
       return;
@@ -618,6 +730,7 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       }
       await handlePost(req, res, url);
     } catch {
+      deps.logger.warn("[local-task-api] request handler error");
       // 兜底：不给 loopback 客户端泄漏错误细节。
       if (!res.headersSent) {
         sendJson(res, 500, { error: "internal_error" });
@@ -658,4 +771,9 @@ export function resolveLocalTaskApiResponse(message: {
   body: unknown;
 }): void {
   registeredDispatcher?.resolveLocalTaskApiResponse(message);
+}
+
+/** Host 进程退出时由 desktopHostProcess 调：立即结清该 Host 的在飞请求，不等 300s 兜底。 */
+export function settleLocalTaskApiRequestsForHost(host: unknown): void {
+  registeredDispatcher?.settleRequestsForHost(host);
 }

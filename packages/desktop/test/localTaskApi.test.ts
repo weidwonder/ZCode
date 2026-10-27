@@ -6,7 +6,7 @@ import {
   type IncomingHttpHeaders,
   type Server,
 } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -372,7 +372,7 @@ describe("localTaskApi", () => {
         path: "/api/tasks",
         headers: { authorization: BEARER, "content-type": "application/json" },
       },
-      JSON.stringify({ workspacePath: OPEN_WS, prompt: "do it", mode: "code", title: "T" }),
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "do it", mode: "plan", title: "T" }),
     );
     await waitForCaptured(captured, 1);
     expect(captured[0].type).toBe("local-task-api-request");
@@ -381,7 +381,7 @@ describe("localTaskApi", () => {
       kind: "create",
       workspacePath: OPEN_WS,
       prompt: "do it",
-      mode: "code",
+      mode: "plan",
       title: "T",
     });
 
@@ -821,5 +821,231 @@ describe("localTaskApi", () => {
     } finally {
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
+  });
+
+  it("create 成功打 info 日志，只含 taskId 不含 workspacePath 与 prompt", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port, logger } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const createP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-log" },
+    });
+    expect((await createP).status).toBe(201);
+
+    const createdCall = logger.info.mock.calls.find((call) =>
+      String(call[0]).includes("created task="),
+    );
+    expect(createdCall).toBeDefined();
+    expect(String(createdCall?.[0])).toBe("[local-task-api] created task=t-log");
+  });
+
+  it("dispatcher：Host 应答 ok:false → 503 且 logger.warn 打 dispatch failed（host_error）", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const warn = vi.fn();
+    const failing = createLocalTaskApiDispatcher({
+      resolveHost: () => ({
+        postMessage: (message: unknown) => {
+          captured.push(message as HostLocalTaskApiRequestMessage);
+        },
+      }),
+      logger: { warn },
+    });
+    const pending = failing.dispatch(OPEN_WS, { kind: "list", workspacePath: OPEN_WS });
+    await waitForCaptured(captured, 1);
+    failing.resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: false,
+      status: 500,
+      body: { error: "host_boom" },
+    });
+    expect(await pending).toEqual({ status: 503, body: { error: "host_boom" } });
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0]?.[0]);
+    expect(line).toContain("dispatch failed");
+    expect(line).toContain(`request=${captured[0].requestId}`);
+    expect(line).toContain("reason=host_error");
+  });
+
+  it("401 拒绝后 logger.warn 打 rejected unauthorized（键名+计数，不含路径）", async () => {
+    const { port, logger } = await startServer();
+    const res = await send(
+      { port, method: "POST", path: "/api/tasks", headers: { "content-type": "application/json" } },
+      CREATE_BODY,
+    );
+    expect(res.status).toBe(401);
+    const rejectedCall = logger.warn.mock.calls.find((call) =>
+      String(call[0]).includes("rejected unauthorized"),
+    );
+    expect(rejectedCall).toBeDefined();
+    expect(String(rejectedCall?.[0])).toBe("[local-task-api] rejected unauthorized count=1");
+    expect(String(rejectedCall?.[0])).not.toContain("/api/tasks");
+  });
+
+  it("mode 校验：非法值与空串 → 400 不 dispatch；合法 plan 放行", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    const bogus = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", mode: "bogus" }),
+    );
+    expect(bogus.status).toBe(400);
+    expect(JSON.parse(bogus.text)).toEqual({ error: "bad_request" });
+
+    const empty = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", mode: "" }),
+    );
+    expect(empty.status).toBe(400);
+    expect(captured).toHaveLength(0); // 两个 400 都未触达 Host
+
+    const ok = send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", mode: "plan" }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({
+      kind: "create",
+      workspacePath: OPEN_WS,
+      prompt: "p",
+      mode: "plan",
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-mode" },
+    });
+    expect((await ok).status).toBe(201);
+  });
+
+  it("clientRequestId：同 id 二次 create 命中幂等不再 dispatch；不同 id 正常；超长 400", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port, logger } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    const first = send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", clientRequestId: "cid-1" }),
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-cid" },
+    });
+    expect((await first).status).toBe(201);
+
+    const second = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", clientRequestId: "cid-1" }),
+    );
+    expect(second.status).toBe(201);
+    expect(JSON.parse(second.text)).toEqual({ taskId: "t-cid" });
+    expect(captured).toHaveLength(1); // 幂等命中：未再 dispatch
+    expect(
+      logger.info.mock.calls.some((call) =>
+        String(call[0]).includes("duplicate create request=cid-1 task=t-cid"),
+      ),
+    ).toBe(true);
+
+    const third = send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", clientRequestId: "cid-2" }),
+    );
+    await waitForCaptured(captured, 2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-cid-2" },
+    });
+    expect((await third).status).toBe(201);
+
+    const tooLong = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "p", clientRequestId: "x".repeat(201) }),
+    );
+    expect(tooLong.status).toBe(400);
+    expect(JSON.parse(tooLong.text)).toEqual({ error: "bad_request" });
+  });
+
+  it("开关文件 group/others 可读（0o644）→ warn 提醒 chmod 600", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-task-api-perm-"));
+    tempDirs.push(root);
+    const configPath = join(root, LOCAL_TASK_API_CONFIG_FILE);
+    const port = await reservePort();
+    await writeFile(configPath, JSON.stringify({ enabled: true, port, token: TOKEN }), "utf8");
+    await chmod(configPath, 0o644);
+
+    const logger = makeLogger();
+    const server = await createLocalTaskApi({
+      readConfig: () => readLocalTaskApiConfig(root),
+      configPath,
+      resolveHost: () => null,
+      zcodeVersion: ZCODE_VERSION,
+      logger,
+    });
+    if (server) {
+      closeLater.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    }
+    const permCall = logger.warn.mock.calls.find((call) =>
+      String(call[0]).includes("readable by group/others"),
+    );
+    expect(permCall).toBeDefined();
+  });
+
+  it("settleRequestsForHost：Host 退出立即 503 结清本 Host 在飞；其他 Host 不受影响", async () => {
+    const capturedA: HostLocalTaskApiRequestMessage[] = [];
+    const capturedB: HostLocalTaskApiRequestMessage[] = [];
+    const hostA = {
+      postMessage: (message: unknown) => {
+        capturedA.push(message as HostLocalTaskApiRequestMessage);
+      },
+    };
+    const hostB = {
+      postMessage: (message: unknown) => {
+        capturedB.push(message as HostLocalTaskApiRequestMessage);
+      },
+    };
+    let current: typeof hostA | typeof hostB = hostA;
+    const dispatcher = createLocalTaskApiDispatcher({
+      resolveHost: () => current,
+      timeoutMs: 60_000,
+      logger: { warn: vi.fn() },
+    });
+
+    const pendingA = dispatcher.dispatch(OPEN_WS, { kind: "list", workspacePath: OPEN_WS });
+    await waitForCaptured(capturedA, 1);
+    expect(dispatcher.settleRequestsForHost(hostA)).toBe(1);
+    expect(await pendingA).toEqual({ status: 503, body: { error: "unavailable_host" } });
+
+    current = hostB;
+    const pendingB = dispatcher.dispatch(OPEN_WS, { kind: "list", workspacePath: OPEN_WS });
+    await waitForCaptured(capturedB, 1);
+    // settle 已退出的 A 不影响 B 的在飞请求：B 仍可用回流应答正常结算。
+    expect(dispatcher.settleRequestsForHost(hostA)).toBe(0);
+    dispatcher.resolveLocalTaskApiResponse({
+      requestId: capturedB[0].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
+    expect(await pendingB).toEqual({ status: 200, body: { ok: true } });
   });
 });
