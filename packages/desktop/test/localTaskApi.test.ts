@@ -985,6 +985,74 @@ describe("localTaskApi", () => {
     expect(JSON.parse(tooLong.text)).toEqual({ error: "bad_request" });
   });
 
+  it("clientRequestId 并发同 id：in-flight 共享同一应答，postMessage 只收到一次 create", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port, logger } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      workspacePath: OPEN_WS,
+      prompt: "p",
+      clientRequestId: "cid-conc",
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    const second = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    // 回流前两个请求都已 in-flight：首个已 dispatch、次个已挂在共享 future 上。
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(captured).toHaveLength(1); // 只 dispatch 一次
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-conc" },
+    });
+    const [resA, resB] = await Promise.all([first, second]);
+    expect(resA.status).toBe(201);
+    expect(resB.status).toBe(201);
+    expect(JSON.parse(resA.text)).toEqual({ taskId: "t-conc" });
+    expect(JSON.parse(resB.text)).toEqual({ taskId: "t-conc" });
+    // 等待方也拿到 duplicate 日志，task 取共享应答里的 taskId（首个请求打 created task=）。
+    expect(
+      logger.info.mock.calls.filter((call) =>
+        String(call[0]).includes("duplicate create request=cid-conc task=t-conc"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("clientRequestId 失败不缓存：同 id 重发重新 dispatch，二次成功", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      workspacePath: OPEN_WS,
+      prompt: "p",
+      clientRequestId: "cid-fail",
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect((await first).status).toBe(503);
+
+    // 失败未缓存：同 id 重发重新 dispatch 而不是回旧应答。
+    const second = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    await waitForCaptured(captured, 2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-retry" },
+    });
+    const retry = await second;
+    expect(retry.status).toBe(201);
+    expect(JSON.parse(retry.text)).toEqual({ taskId: "t-retry" });
+  });
+
   it("开关文件 group/others 可读（0o644）→ warn 提醒 chmod 600", async () => {
     const root = await mkdtemp(join(tmpdir(), "local-task-api-perm-"));
     tempDirs.push(root);

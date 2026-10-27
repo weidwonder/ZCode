@@ -960,8 +960,8 @@ export type HostResourceUsageSnapshotRequestMessage = z.infer<
   typeof hostResourceUsageSnapshotRequestMessageSchema
 >;
 
-/** create op 的 mode 枚举：与 ZCodeTaskMode 全集一致（下方类型互检钉住）。 */
-const localTaskApiTaskModeSchema = z.enum([
+/** 本机任务 API 接受的 mode 全集；单一事实来源，ZCodeTaskMode 加值时由下方双向互检钉住同步。 */
+export const localTaskApiTaskModes = [
   "default",
   "yolo",
   "guarded",
@@ -973,7 +973,9 @@ const localTaskApiTaskModeSchema = z.enum([
   "bypassPermissions",
   "autoEdit",
   "build",
-]);
+] as const;
+/** create op 的 mode 枚举：与 ZCodeTaskMode 全集一致（下方类型互检钉住）。 */
+const localTaskApiTaskModeSchema = z.enum(localTaskApiTaskModes);
 /** 与 ZCodeTaskMode 全集双向互检：上游加/删值时这里编译失败，提示同步枚举。 */
 type _TaskModeEnumMatchesZCodeTaskMode = [
   z.infer<typeof localTaskApiTaskModeSchema>,

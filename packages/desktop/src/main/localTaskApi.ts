@@ -7,7 +7,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAppConfigDir } from "@zcode/services/node";
-import { HostMessageTypes, type LocalTaskApiRequestOp } from "@zcode/shared";
+import { HostMessageTypes, localTaskApiTaskModes, type LocalTaskApiRequestOp } from "@zcode/shared";
 
 export const LOCAL_TASK_API_CONFIG_FILE = "local-task-api.json";
 /** POST body 上限：16 MiB，超出回 413。 */
@@ -17,15 +17,20 @@ const MIN_TOKEN_CHARS = 32;
 /** dispatcher 兜底超时（events 的 waitMs 上限 30s 远小于此）。 */
 const DISPATCH_TIMEOUT_MS = 300_000;
 
-/** 与 ZCodeTaskMode 全集对齐（packages/shared/src/zcode-task-types-core.ts 的 ZCodeTaskMode）；上游加值时这里同步，否则 400。 */
-const TASK_MODES = new Set([
-  "default", "yolo", "guarded", "plan", "edit", "acceptEdits",
-  "auto", "dontAsk", "bypassPermissions", "autoEdit", "build",
-] as const);
-type TaskModeValue = Parameters<typeof TASK_MODES.has>[0];
+/** 与 ZCodeTaskMode 全集对齐（shared validation.ts 的 localTaskApiTaskModes，双向互检钉住）；未知值 create 先 400。 */
+const TASK_MODES = new Set<string>(localTaskApiTaskModes);
 
 /** clientRequestId 幂等窗口：TTL 内同 id 重复 create 直接回已有 taskId，不再 dispatch。 */
 const CLIENT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
+
+/** clientRequestId 幂等表的条目：创建期间带共享应答 future，成功后落 taskId 缓存、失败即清除。 */
+interface ClientRequestIdEntry {
+  expiresAt: number;
+  /** in-flight 期共享的完整应答 future；完成后移除并落 taskId 缓存。 */
+  future?: Promise<{ status: number; body: unknown }>;
+  /** 成功后缓存 10 分钟的 taskId。 */
+  taskId?: string;
+}
 
 export interface LocalTaskApiConfig {
   enabled: boolean;
@@ -201,8 +206,9 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
   setLocalTaskApiDispatcher(dispatcher);
 
   const taskWorkspaceByTaskId = new Map<string, string>();
-  // clientRequestId 幂等表：TTL 内同 id 重复 create 直接回已有 taskId（不透传 Host）。
-  const createdTaskByClientRequestId = new Map<string, { taskId: string; expiresAt: number }>();
+  // clientRequestId 幂等表：TTL 内同 id 重复 create 直接回已有 taskId（不透传 Host）；
+  // 创建期间存共享 future，并发同 id 等同一应答、不重复 dispatch。
+  const createdTaskByClientRequestId = new Map<string, ClientRequestIdEntry>();
   // 拒绝计数：仅内存聚合；每次自增输出一行 warn（只含键名与新值，不含路径与请求内容）。
   const rejected = {
     unauthorized: 0,
@@ -574,7 +580,8 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         }
         normalizedClientRequestId = clientRequestId;
       }
-      // clientRequestId 幂等：body 校验通过后先惰性清过期项，命中未过期直接回已有 taskId。
+      // clientRequestId 幂等：body 校验通过后先惰性清过期项，再按命中形态分流——
+      // taskId 缓存命中直接回已有 taskId；in-flight future 命中则等待同一应答（不重复 dispatch）。
       if (normalizedClientRequestId !== null) {
         const now = Date.now();
         for (const [key, value] of createdTaskByClientRequestId) {
@@ -583,46 +590,88 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
           }
         }
         const hit = createdTaskByClientRequestId.get(normalizedClientRequestId);
-        if (hit) {
-          deps.logger.info(
-            `[local-task-api] duplicate create request=${normalizedClientRequestId} task=${hit.taskId}`,
-          );
-          sendJson(res, 201, { taskId: hit.taskId });
-          return;
+        if (hit !== undefined) {
+          if (hit.future !== undefined) {
+            const shared = await hit.future;
+            const sharedTaskId =
+              isRecord(shared.body) && typeof shared.body["taskId"] === "string"
+                ? shared.body["taskId"]
+                : "unknown";
+            deps.logger.info(
+              `[local-task-api] duplicate create request=${normalizedClientRequestId} task=${sharedTaskId}`,
+            );
+            // 等待方直接透传首个请求的应答：归属表由首个请求登记，这里不重复登记。
+            sendJson(res, shared.status, shared.body);
+            return;
+          }
+          if (hit.taskId !== undefined) {
+            deps.logger.info(
+              `[local-task-api] duplicate create request=${normalizedClientRequestId} task=${hit.taskId}`,
+            );
+            sendJson(res, 201, { taskId: hit.taskId });
+            return;
+          }
         }
       }
       const op: LocalTaskApiRequestOp = {
         kind: "create",
         workspacePath,
         prompt,
-        ...(typeof mode === "string" && TASK_MODES.has(mode as never)
-          ? { mode: mode as TaskModeValue }
+        ...(typeof mode === "string" && TASK_MODES.has(mode)
+          ? { mode: mode as (typeof localTaskApiTaskModes)[number] }
           : {}),
         ...(typeof title === "string" ? { title } : {}),
       };
-      const result = await dispatcher.dispatch(workspacePath, op);
-      if (result.status === 409) {
-        noteReject("workspaceNotOpen");
+      // 有 clientRequestId 时先登记 in-flight future：并发同 id 共享同一应答；
+      // dispatch 结束后成功落 taskId 缓存（覆写，清 future）、失败清除（可重试），
+      // 抛异常也要结清 future 与表项，避免等待方悬死。
+      let settleFuture: ((result: { status: number; body: unknown }) => void) | null = null;
+      if (normalizedClientRequestId !== null) {
+        let resolveFuture!: (result: { status: number; body: unknown }) => void;
+        const inflight = new Promise<{ status: number; body: unknown }>((resolve) => {
+          resolveFuture = resolve;
+        });
+        settleFuture = resolveFuture;
+        createdTaskByClientRequestId.set(normalizedClientRequestId, {
+          expiresAt: Date.now() + CLIENT_REQUEST_ID_TTL_MS,
+          future: inflight,
+        });
       }
-      if (result.status === 503) {
-        noteReject("unavailable");
-      }
-      // Host 侧部分失败会以 2xx + warning 应答，只要 body 形如 {taskId} 就登记。
-      const createdTaskId =
-        isRecord(result.body) && typeof result.body["taskId"] === "string"
-          ? result.body["taskId"]
-          : null;
-      if (result.status >= 200 && result.status < 300 && createdTaskId !== null) {
-        taskWorkspaceByTaskId.set(createdTaskId, workspacePath);
-        deps.logger.info(`[local-task-api] created task=${createdTaskId}`);
-        if (normalizedClientRequestId !== null) {
-          createdTaskByClientRequestId.set(normalizedClientRequestId, {
-            taskId: createdTaskId,
-            expiresAt: Date.now() + CLIENT_REQUEST_ID_TTL_MS,
-          });
+      try {
+        const result = await dispatcher.dispatch(workspacePath, op);
+        if (result.status === 409) {
+          noteReject("workspaceNotOpen");
         }
+        if (result.status === 503) {
+          noteReject("unavailable");
+        }
+        // Host 侧部分失败会以 2xx + warning 应答，只要 body 形如 {taskId} 就登记。
+        const createdTaskId =
+          isRecord(result.body) && typeof result.body["taskId"] === "string"
+            ? result.body["taskId"]
+            : null;
+        if (result.status >= 200 && result.status < 300 && createdTaskId !== null) {
+          taskWorkspaceByTaskId.set(createdTaskId, workspacePath);
+          deps.logger.info(`[local-task-api] created task=${createdTaskId}`);
+          if (normalizedClientRequestId !== null) {
+            createdTaskByClientRequestId.set(normalizedClientRequestId, {
+              taskId: createdTaskId,
+              expiresAt: Date.now() + CLIENT_REQUEST_ID_TTL_MS,
+            });
+          }
+        } else if (normalizedClientRequestId !== null) {
+          createdTaskByClientRequestId.delete(normalizedClientRequestId);
+        }
+        settleFuture?.(result);
+        sendJson(res, result.status, result.body);
+      } catch {
+        if (normalizedClientRequestId !== null) {
+          createdTaskByClientRequestId.delete(normalizedClientRequestId);
+        }
+        noteReject("unavailable");
+        settleFuture?.({ status: 503, body: { error: "unavailable_host" } });
+        sendJson(res, 503, { error: "unavailable_host" });
       }
-      sendJson(res, result.status, result.body);
       return;
     }
 
