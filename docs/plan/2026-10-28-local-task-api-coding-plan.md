@@ -17,6 +17,8 @@ authority_refs:
 
 **模型分工（用户要求）**：代码与测试由 model:"haiku" 的内部子代理编写；本会话负责拆分、任务书、审读、修偏、验证与提交。haiku 同一处两次返工不过的部分由本会话接手（总结中写明分工）。
 
+**分工实际执行记录（2026-10-28）**：Task 1（shared 消息对 + Host responder + 16 用例）与 Task 2（Main HTTP + 接线 + 17 用例）各由一个 haiku 子代理一次过（typecheck 0 错、测试全绿，歧义决定合理，主会话复核确认）；本会话审读后仅修 7 处 lint unsafe-optional-chaining 警告（1742b785）。上游文档与全部 dw 产物由本会话编写。
+
 ---
 
 ### Task 1（haiku）：shared 消息对 + Host responder + 测试
