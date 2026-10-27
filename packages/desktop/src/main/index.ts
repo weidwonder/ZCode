@@ -92,6 +92,8 @@ import {
   InternalChannels,
 } from "@zcode/shared";
 import { logger, webRemoteControlRelayLogger } from "./logger.js";
+import { createLocalTaskApi } from "./localTaskApi.js";
+import type { Server } from "node:http";
 import { markMainLaunchAppReady } from "./desktopLaunchMarks.js";
 import { createCuaPipFocusRouter, resolveCuaPipWindowKey } from "./cuaPipFocusRouter.js";
 import { createDesktopTelemetryFetch } from "./desktopTelemetryFetch.js";
@@ -699,6 +701,9 @@ function resolveCronDispatchHost(): ElectronUtilityProcess | null {
   const first = windowHostProcessMap.values().next();
   return first.done ? null : first.value;
 }
+// 本机任务 API：Main 内全应用唯一监听；workspace→Host 路由用 taskRealtimeBus
+// 的 hosts 注册表（workspaceKey = 本地 workspacePath），任务业务在窗口 Host。
+let localTaskApiServer: Server | null = null;
 const disposingHostProcessTimers = new WeakMap<
   ElectronUtilityProcess,
   ReturnType<typeof setTimeout>
@@ -1188,6 +1193,9 @@ async function prepareAppQuit(reason: string, kind: AppShutdownKind = "normal"):
   }
 
   markForceQuit(reason);
+  // 本机任务 API 随退出关闭；飞行中的请求由各自 HTTP 超时收口。
+  localTaskApiServer?.close();
+  localTaskApiServer = null;
   windowsCuaOperationIndicator.dispose();
   browserScreenshotSurfaceCoordinator.dispose();
   // Bug 根因：资源样本改为 5 分钟窗口后，退出仍直接 stop 会清空未满窗口的数据。
@@ -2123,6 +2131,16 @@ app.whenReady().then(async () => {
   } catch {
     // 读取失败不影响启动，使用默认 homedir
   }
+
+  // 本机任务 API：随应用进程常驻；开关文件 local-task-api.json 只在此时读取一次，
+  // 必须在 setDataBaseDir 之后创建，路径跟随用户自定义数据目录。
+  void createLocalTaskApi({
+    resolveHost: (workspacePath) => taskRealtimeBus.findHostProcessByWorkspaceKey(workspacePath),
+    zcodeVersion: ZCODE_VERSION || app.getVersion(),
+    logger,
+  }).then((server) => {
+    localTaskApiServer = server;
+  });
 
   // scheduler 也会打开 tasks-index；等 Host 完成统一准备，避免在启动页出现前抢先迁移。
   configureDatabaseStartupQuit(() => {

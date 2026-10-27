@@ -1,0 +1,647 @@
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { request as clientRequest } from "node:http";
+import {
+  createServer as createHttpServer,
+  type AddressInfo,
+  type IncomingHttpHeaders,
+  type Server,
+} from "node:http";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  LOCAL_TASK_API_CONFIG_FILE,
+  createLocalTaskApi,
+  createLocalTaskApiDispatcher,
+  readLocalTaskApiConfig,
+  resolveLocalTaskApiResponse,
+  setLocalTaskApiDispatcher,
+  type LocalTaskApiConfig,
+} from "../src/main/localTaskApi.js";
+import type { HostLocalTaskApiRequestMessage } from "@zcode/shared";
+
+const TOKEN = "a".repeat(40);
+const BEARER = `Bearer ${TOKEN}`;
+const OPEN_WS = "/ws/open";
+const ZCODE_VERSION = "9.9.9-test";
+
+const closeLater: Array<() => Promise<void>> = [];
+const tempDirs: string[] = [];
+
+function makeLogger() {
+  return { info: vi.fn(), warn: vi.fn() };
+}
+
+async function reservePort(): Promise<number> {
+  const server = createHttpServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+function capturingResolveHost(captured: HostLocalTaskApiRequestMessage[]) {
+  return (workspacePath: string) => {
+    if (workspacePath !== OPEN_WS) return null;
+    return {
+      postMessage: (message: unknown) => {
+        captured.push(message as HostLocalTaskApiRequestMessage);
+      },
+    };
+  };
+}
+
+async function startServer(
+  overrides: {
+    readConfig?: () => Promise<LocalTaskApiConfig | null | "invalid">;
+    resolveHost?: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
+  } = {},
+): Promise<{ port: number; logger: ReturnType<typeof makeLogger>; server: Server | null }> {
+  const port = await reservePort();
+  const logger = makeLogger();
+  const server = await createLocalTaskApi({
+    readConfig: overrides.readConfig ?? (async () => ({ enabled: true, port, token: TOKEN })),
+    resolveHost: overrides.resolveHost ?? (() => null),
+    zcodeVersion: ZCODE_VERSION,
+    logger,
+  });
+  if (server) {
+    closeLater.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  }
+  return { port, logger, server };
+}
+
+interface SendResult {
+  status: number;
+  headers: IncomingHttpHeaders;
+  text: string;
+}
+
+/** 用 http.request 而不是 fetch：Host 头与缺省头行为必须可控。响应一旦见到就不再因
+ * 连接被服务端提前销毁而失败（413 场景服务端会在 flush 后 destroy 请求流）。 */
+function send(
+  params: { port: number; method?: string; path: string; headers?: Record<string, string> },
+  body?: string | Buffer,
+): Promise<SendResult> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let sawResponse = false;
+    let seenStatus = 0;
+    const req = clientRequest(
+      {
+        host: "127.0.0.1",
+        port: params.port,
+        method: params.method ?? "GET",
+        path: params.path,
+        headers: params.headers,
+      },
+      (res) => {
+        sawResponse = true;
+        seenStatus = res.statusCode ?? 0;
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          settled = true;
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            text: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    req.on("error", (error) => {
+      if (settled) return;
+      // 响应头已到（服务端主动断连收尾）时按已收到的内容收口，不让 RST 吞掉断言。
+      if (sawResponse) {
+        settled = true;
+        resolve({ status: seenStatus, headers: {}, text: `connection reset: ${String(error)}` });
+        return;
+      }
+      reject(error);
+    });
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+async function waitForCaptured(
+  captured: HostLocalTaskApiRequestMessage[],
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (captured.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`timeout waiting for ${count} captured messages, got ${captured.length}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+const CREATE_BODY = JSON.stringify({ workspacePath: OPEN_WS, prompt: "hello" });
+
+afterAll(async () => {
+  setLocalTaskApiDispatcher(null);
+  for (const close of closeLater) {
+    await close();
+  }
+  for (const dir of tempDirs) {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+describe("localTaskApi", () => {
+  it("GET /health 返回 200 与版本信息（契约豁免，不做 Host 头校验与鉴权）", async () => {
+    const { port } = await startServer();
+    const res = await send({ port, path: "/health" });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text)).toEqual({
+      ok: true,
+      api: "zcode-local-task-api",
+      version: 2,
+      zcodeVersion: ZCODE_VERSION,
+    });
+  });
+
+  it("Host 头非法的 POST /api/tasks → 403，且 resolveHost 未被调用", async () => {
+    const resolveHost = vi.fn(() => null);
+    const { port } = await startServer({ resolveHost });
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { host: "evil.example.com", "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.text)).toEqual({ error: "host_header_forbidden" });
+    expect(resolveHost).not.toHaveBeenCalled();
+  });
+
+  it("鉴权：无 Authorization → 401；错误 token → 401；正确 token 放行到 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const noAuth = await send(
+      { port, method: "POST", path: "/api/tasks", headers: { "content-type": "application/json" } },
+      CREATE_BODY,
+    );
+    expect(noAuth.status).toBe(401);
+    expect(JSON.parse(noAuth.text)).toEqual({ error: "unauthorized" });
+
+    const badAuth = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: "Bearer wrong", "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    expect(badAuth.status).toBe(401);
+
+    const okAuth = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({ requestId: captured[0].requestId, ok: true, status: 200, body: { ok: true } });
+    expect((await okAuth).status).toBe(200);
+  });
+
+  it("开关三态：缺失/未启用静默返回 null 无 warn，invalid 返回 null 且 warn", async () => {
+    const port = await reservePort();
+    const loggerNull = makeLogger();
+    expect(
+      await createLocalTaskApi({
+        readConfig: async () => null,
+        resolveHost: () => null,
+        zcodeVersion: ZCODE_VERSION,
+        logger: loggerNull,
+      }),
+    ).toBeNull();
+    expect(loggerNull.warn).not.toHaveBeenCalled();
+
+    const loggerDisabled = makeLogger();
+    expect(
+      await createLocalTaskApi({
+        readConfig: async () => ({ enabled: false, port, token: TOKEN }),
+        resolveHost: () => null,
+        zcodeVersion: ZCODE_VERSION,
+        logger: loggerDisabled,
+      }),
+    ).toBeNull();
+    expect(loggerDisabled.warn).not.toHaveBeenCalled();
+
+    const loggerInvalid = makeLogger();
+    expect(
+      await createLocalTaskApi({
+        readConfig: async () => "invalid",
+        resolveHost: () => null,
+        zcodeVersion: ZCODE_VERSION,
+        logger: loggerInvalid,
+      }),
+    ).toBeNull();
+    expect(loggerInvalid.warn).toHaveBeenCalledTimes(1);
+    expect(loggerInvalid.warn).toHaveBeenCalledWith(
+      "[local-task-api] invalid local-task-api.json; api disabled",
+    );
+  });
+
+  it("readLocalTaskApiConfig 专项：缺失/损坏/未启用/端口非法/token 过短/合法 各分支", async () => {
+    const root = await mkdtemp(join(tmpdir(), "local-task-api-cfg-"));
+    tempDirs.push(root);
+    const configPath = join(root, LOCAL_TASK_API_CONFIG_FILE);
+    const writeCfg = async (content: unknown) => {
+      await writeFile(configPath, JSON.stringify(content), "utf8");
+    };
+
+    expect(await readLocalTaskApiConfig(root)).toBeNull();
+
+    await writeFile(configPath, "{not json", "utf8");
+    expect(await readLocalTaskApiConfig(root)).toBe("invalid");
+
+    await writeCfg({ enabled: false, port: 45678, token: TOKEN });
+    expect(await readLocalTaskApiConfig(root)).toBeNull();
+
+    await writeCfg({ enabled: true, port: 0, token: TOKEN });
+    expect(await readLocalTaskApiConfig(root)).toBe("invalid");
+
+    await writeCfg({ enabled: true, port: 45678, token: "a".repeat(31) });
+    expect(await readLocalTaskApiConfig(root)).toBe("invalid");
+
+    await writeCfg({ enabled: true, port: 45678, token: TOKEN });
+    expect(await readLocalTaskApiConfig(root)).toEqual({
+      enabled: true,
+      port: 45678,
+      token: TOKEN,
+    });
+  });
+
+  it("Content-Type：缺头有 body → 415；text/plain → 415；application/json 放行", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const noType = await send(
+      { port, method: "POST", path: "/api/tasks", headers: { authorization: BEARER } },
+      CREATE_BODY,
+    );
+    expect(noType.status).toBe(415);
+    expect(JSON.parse(noType.text)).toEqual({ error: "unsupported_media_type" });
+
+    const textPlain = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "text/plain" },
+      },
+      "hello",
+    );
+    expect(textPlain.status).toBe(415);
+
+    const ok = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({ requestId: captured[0].requestId, ok: true, status: 200, body: { ok: true } });
+    expect((await ok).status).toBe(200);
+  });
+
+  it("body 超过 16 MiB → 413", async () => {
+    const { port } = await startServer();
+    const big = Buffer.alloc(16 * 1024 * 1024 + 8, 0x61);
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      big,
+    );
+    expect(res.status).toBe(413);
+    expect(JSON.parse(res.text)).toEqual({ error: "payload_too_large" });
+  });
+
+  it("DELETE /health → 405 且带 allow: GET, POST；GET /nope → 404", async () => {
+    const { port } = await startServer();
+    const deleted = await send({ port, method: "DELETE", path: "/health" });
+    expect(deleted.status).toBe(405);
+    expect(deleted.headers["allow"]).toBe("GET, POST");
+    expect(JSON.parse(deleted.text)).toEqual({ error: "method_not_allowed" });
+
+    const notFound = await send({ port, path: "/nope" });
+    expect(notFound.status).toBe(404);
+    expect(JSON.parse(notFound.text)).toEqual({ error: "not_found" });
+  });
+
+  it("create 流：postMessage 捕获 op 与 requestId，回流应答后 HTTP 透传 201", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const pending = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "do it", mode: "code", title: "T" }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(captured[0].type).toBe("local-task-api-request");
+    expect(captured[0].requestId.length).toBeGreaterThan(0);
+    expect(captured[0].op).toEqual({
+      kind: "create",
+      workspacePath: OPEN_WS,
+      prompt: "do it",
+      mode: "code",
+      title: "T",
+    });
+
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t1" },
+    });
+    const res = await pending;
+    expect(res.status).toBe(201);
+    expect(JSON.parse(res.text)).toEqual({ taskId: "t1" });
+  });
+
+  it("归属表：create 后 messages 按 workspacePath 路由；未知 taskId → 404", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const createP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t1" },
+    });
+    expect((await createP).status).toBe(201);
+
+    const sendP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/t1/messages",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ text: "hi" }),
+    );
+    await waitForCaptured(captured, 2);
+    expect(captured[1].op).toEqual({
+      kind: "send",
+      workspacePath: OPEN_WS,
+      taskId: "t1",
+      text: "hi",
+      delivery: "auto",
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
+    expect((await sendP).status).toBe(200);
+
+    const miss = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/unknown/messages",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ text: "x" }),
+    );
+    expect(miss.status).toBe(404);
+    expect(JSON.parse(miss.text)).toEqual({ error: "task_not_found" });
+  });
+
+  it("workspace 无 Host → 409 workspace_not_open", async () => {
+    const { port } = await startServer();
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/closed", prompt: "p" }),
+    );
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_not_open" });
+  });
+
+  it("dispatcher：Host 应答 ok:false → 503；超时未应答 → 503", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const failing = createLocalTaskApiDispatcher({
+      resolveHost: () => ({
+        postMessage: (message: unknown) => {
+          captured.push(message as HostLocalTaskApiRequestMessage);
+        },
+      }),
+    });
+    const pending = failing.dispatch(OPEN_WS, { kind: "list", workspacePath: OPEN_WS });
+    await waitForCaptured(captured, 1);
+    failing.resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: false,
+      status: 500,
+      body: { error: "host_boom" },
+    });
+    expect(await pending).toEqual({ status: 503, body: { error: "host_boom" } });
+
+    const timingOut = createLocalTaskApiDispatcher({
+      resolveHost: () => ({ postMessage: () => {} }),
+      timeoutMs: 20,
+    });
+    const timedOut = await timingOut.dispatch(OPEN_WS, { kind: "list", workspacePath: OPEN_WS });
+    expect(timedOut).toEqual({ status: 503, body: { error: "unavailable_host" } });
+  });
+
+  it("events 参数：after 非法取 0、waitMs clamp 到 30000；缺省 after=0 waitMs=0", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const createP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t1" },
+    });
+    await createP;
+
+    const weird = send({
+      port,
+      path: "/api/tasks/t1/events?after=abc&waitMs=99999",
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 2);
+    expect(captured[1].op).toEqual({
+      kind: "events",
+      workspacePath: OPEN_WS,
+      taskId: "t1",
+      after: 0,
+      waitMs: 30000,
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 200,
+      body: { events: [] },
+    });
+    expect((await weird).status).toBe(200);
+
+    const defaults = send({
+      port,
+      path: "/api/tasks/t1/events",
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 3);
+    expect(captured[2].op).toEqual({
+      kind: "events",
+      workspacePath: OPEN_WS,
+      taskId: "t1",
+      after: 0,
+      waitMs: 0,
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[2].requestId,
+      ok: true,
+      status: 200,
+      body: { events: [] },
+    });
+    expect((await defaults).status).toBe(200);
+  });
+
+  it("GET /api/tasks?workspacePath=… → list op；workspacePath 缺失 → 400", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const pending = send({
+      port,
+      path: `/api/tasks?workspacePath=${encodeURIComponent(OPEN_WS)}`,
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({ kind: "list", workspacePath: OPEN_WS });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { tasks: [] },
+    });
+    expect((await pending).status).toBe(200);
+
+    const missing = await send({ port, path: "/api/tasks", headers: { authorization: BEARER } });
+    expect(missing.status).toBe(400);
+    expect(JSON.parse(missing.text)).toEqual({ error: "bad_request" });
+  });
+
+  it("stop：无 body 无 content-type 放行，应答 202 透传", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const createP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      CREATE_BODY,
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t1" },
+    });
+    await createP;
+
+    const stopP = send({
+      port,
+      method: "POST",
+      path: "/api/tasks/t1/stop",
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 2);
+    expect(captured[1].op).toEqual({ kind: "stop", workspacePath: OPEN_WS, taskId: "t1" });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 202,
+      body: { ok: true },
+    });
+    const res = await stopP;
+    expect(res.status).toBe(202);
+    expect(JSON.parse(res.text)).toEqual({ ok: true });
+  });
+
+  it("响应不带 CORS 头", async () => {
+    const { port } = await startServer();
+    const res = await send({ port, path: "/health" });
+    expect(res.status).toBe(200);
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("端口被占 → resolve null 不抛", async () => {
+    const blocker = createHttpServer((_req, res) => {
+      res.end("occupied");
+    });
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const port = (blocker.address() as AddressInfo).port;
+    try {
+      const logger = makeLogger();
+      const server = await createLocalTaskApi({
+        readConfig: async () => ({ enabled: true, port, token: TOKEN }),
+        resolveHost: () => null,
+        zcodeVersion: ZCODE_VERSION,
+        logger,
+      });
+      expect(server).toBeNull();
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(String(logger.warn.mock.calls[0]?.[0])).toContain("listen on 127.0.0.1");
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+});
