@@ -92,6 +92,12 @@ import {
   InternalChannels,
 } from "@zcode/shared";
 import { logger, webRemoteControlRelayLogger } from "./logger.js";
+import {
+  createBotWebhookIngress,
+  createBotWebhookIngressDispatcher,
+  setBotWebhookIngressDispatcher,
+} from "./botWebhookIngress.js";
+import type { Server } from "node:http";
 import { markMainLaunchAppReady } from "./desktopLaunchMarks.js";
 import { createCuaPipFocusRouter, resolveCuaPipWindowKey } from "./cuaPipFocusRouter.js";
 import { createDesktopTelemetryFetch } from "./desktopTelemetryFetch.js";
@@ -699,6 +705,16 @@ function resolveCronDispatchHost(): ElectronUtilityProcess | null {
   const first = windowHostProcessMap.values().next();
   return first.done ? null : first.value;
 }
+// 本机 Webhook Bot 入站端点：Main 内全应用唯一监听，bot 业务经 postMessage 转发给
+// 任一存活窗口 Host（webhook 回调无 channel runtime 锁，任一 Host 均可处理）。
+let botWebhookIngressServer: Server | null = null;
+const botWebhookIngressDispatcher = createBotWebhookIngressDispatcher({
+  getHost: () => {
+    const first = windowHostProcessMap.values().next();
+    return first.done ? null : first.value;
+  },
+});
+setBotWebhookIngressDispatcher(botWebhookIngressDispatcher);
 const disposingHostProcessTimers = new WeakMap<
   ElectronUtilityProcess,
   ReturnType<typeof setTimeout>
@@ -1188,6 +1204,9 @@ async function prepareAppQuit(reason: string, kind: AppShutdownKind = "normal"):
   }
 
   markForceQuit(reason);
+  // 本机 Webhook Bot 入站端点随退出关闭；不再接收新回调，飞行中的请求由各自 HTTP 超时收口。
+  botWebhookIngressServer?.close();
+  botWebhookIngressServer = null;
   windowsCuaOperationIndicator.dispose();
   browserScreenshotSurfaceCoordinator.dispose();
   // Bug 根因：资源样本改为 5 分钟窗口后，退出仍直接 stop 会清空未满窗口的数据。
@@ -2123,6 +2142,16 @@ app.whenReady().then(async () => {
   } catch {
     // 读取失败不影响启动，使用默认 homedir
   }
+
+  // 本机 Webhook Bot 入站端点：随应用进程常驻（与窗口生死解耦）；开关文件只在此时读取一次。
+  // 必须在 setDataBaseDir 之后创建，开关文件路径跟随用户自定义数据目录。
+  void createBotWebhookIngress({
+    dispatch: botWebhookIngressDispatcher.dispatch,
+    zcodeVersion: ZCODE_VERSION || app.getVersion(),
+    logger,
+  }).then((server) => {
+    botWebhookIngressServer = server;
+  });
 
   // scheduler 也会打开 tasks-index；等 Host 完成统一准备，避免在启动页出现前抢先迁移。
   configureDatabaseStartupQuit(() => {

@@ -747,6 +747,13 @@ global:
   acceptedUpstreamSnapshot: scripts/architecture/upstream-snapshot.json
 
 exceptions:
+  - id: bot-webhook-ingress-unmanaged-new-file
+    rule: unmanaged-new-file
+    paths:
+      - packages/services/src/bots/webhookCallbackHttp.ts
+      - packages/desktop/src/main/botWebhookIngress.ts
+      - packages/desktop/src/host/botWebhookIngressResponder.ts
+    reason: 本机 Webhook Bot 入站端点（docs/bot-webhook-ingress.md）：三个新文件分别是 Web/桌面共用的回调处理、Main 进程监听与 Host 侧应答器，行为经 services 共享函数收口；补丁需长期跟随上游 rebase，接管 desktop/services 全目录带来的治理面远超本次改动，不为三个文件整体 adopt。
   - id: side-pane-full-view-shortcut-command-edit
     rule: unmanaged-new-file
     paths: [packages/shared/src/shortcutCommands.ts]
