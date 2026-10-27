@@ -114,6 +114,8 @@ export function ProviderSettingsCard({
   bot,
   runtime,
   credentialValue,
+  webhookUrlDraft,
+  onWebhookUrlDraftChange,
   bindCode,
   bindExpired,
   bindRemainingMs,
@@ -126,6 +128,8 @@ export function ProviderSettingsCard({
   secretSaving,
   onCredentialValueChange,
   onSaveSecret,
+  onSaveWebhookUrl,
+  onSaveWebhookSecret,
   onRemoveSecret,
   onOpenTelegramBotFather,
   onStartWeixinRegistration,
@@ -137,6 +141,8 @@ export function ProviderSettingsCard({
   bot: BotConfig;
   runtime: BotServiceStatus["botRuntime"][number] | undefined;
   credentialValue: string;
+  webhookUrlDraft: string;
+  onWebhookUrlDraftChange: (value: string) => void;
   bindCode: BindCodeState | null;
   bindExpired: boolean;
   bindRemainingMs: number;
@@ -149,6 +155,8 @@ export function ProviderSettingsCard({
   secretSaving: boolean;
   onCredentialValueChange: (value: string) => void;
   onSaveSecret: () => void;
+  onSaveWebhookUrl: () => void;
+  onSaveWebhookSecret: () => void;
   onRemoveSecret: () => void;
   onOpenTelegramBotFather: () => void;
   onStartWeixinRegistration: () => void;
@@ -159,7 +167,71 @@ export function ProviderSettingsCard({
 }) {
   const { intl } = useZCodeIntl();
   if (bot.provider === "webhook") {
-    return null;
+    // webhook 没有第三方凭据绑定流：出站地址与入站密钥各自独立成行。
+    const hasWebhookSecret = Boolean(bot.webhookSecretRef);
+    return (
+      <SettingsGroupCard>
+        <SettingsRow
+          label={intl.formatMessage({ id: "bots.webhookUrl.label" })}
+          description={intl.formatMessage({ id: "bots.webhookUrl.description" })}
+          control={
+            <div className="flex w-full min-w-0 items-center gap-2">
+              <Input
+                size="lg"
+                type="url"
+                value={webhookUrlDraft}
+                onChange={(event) => onWebhookUrlDraftChange(event.target.value)}
+                placeholder="https://"
+                className="min-w-0 flex-1"
+              />
+              <Button variant="outline" size="lg" onClick={onSaveWebhookUrl}>
+                {intl.formatMessage({ id: "common.save" })}
+              </Button>
+            </div>
+          }
+        />
+        <SettingsRow
+          label={intl.formatMessage({ id: "bots.webhookSecret.label" })}
+          description={intl.formatMessage({ id: "bots.webhookSecret.description" })}
+          control={
+            hasWebhookSecret ? (
+              <div className="flex items-center justify-end gap-3">
+                <span className="text-ui-base text-foreground-subtle">
+                  {intl.formatMessage({ id: "bots.webhookSecret.saved" })}
+                </span>
+                <Button variant="outline" size="lg" onClick={onRemoveSecret}>
+                  {intl.formatMessage({ id: "bots.removeSecret" })}
+                </Button>
+              </div>
+            ) : (
+              <div className="flex w-full min-w-0 items-center gap-2">
+                <Input
+                  size="lg"
+                  type="password"
+                  value={credentialValue}
+                  onChange={(event) => onCredentialValueChange(event.target.value)}
+                  className="min-w-0 flex-1"
+                  disabled={secretSaving}
+                />
+                <Button
+                  variant="outline"
+                  size="lg"
+                  onClick={onSaveWebhookSecret}
+                  disabled={secretSaving || !credentialValue.trim()}
+                >
+                  {secretSaving ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <KeyRound className="size-4" />
+                  )}
+                  {intl.formatMessage({ id: "bots.saveSecret" })}
+                </Button>
+              </div>
+            )
+          }
+        />
+      </SettingsGroupCard>
+    );
   }
   const hasSecret = Boolean(bot.credentialRef);
   const isFeishuLike = isFeishuBotProvider(bot.provider);
