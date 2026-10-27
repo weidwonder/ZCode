@@ -34,7 +34,7 @@ Opt-in via a config file read once at startup:
 ## Routing and error model
 
 - Requests are routed to the window Host that currently owns the workspace. A workspace that is not open in any window yields `409 {"error":"workspace_not_open"}` — the API never opens workspaces on its own.
-- The main process keeps an in-memory map of tasks created through this API (`taskId → workspacePath`). After an app restart, operations on task ids created before the restart return `404 {"error":"task_not_found"}`; create a new task instead. Unknown task ids get the same response.
+- The main process keeps an in-memory map of tasks created through this API (`taskId → workspacePath`). Every `:taskId` endpoint (messages/stop/get/events) also accepts an **optional `workspacePath`** — a query parameter on the GET routes, a body field on the POST routes. When the map misses (for example after an app restart) and `workspacePath` is provided, the request is routed to the Host owning that workspace, which verifies the task really belongs to it; a 2xx response back-fills the map, so subsequent requests can omit `workspacePath`. A miss without `workspacePath` returns `404 {"error":"task_not_found"}`, as does a `workspacePath` the task does not belong to. After a restart the per-task event buffer starts empty: the first events call returns no events plus the current `nextSeq`, and clients can recover full state from `GET /api/tasks/:taskId`.
 - If no window Host is alive or the Host fails to answer, the API returns `503 {"error":"unavailable_host"}` (a dispatcher-level 300s backstop bounds hung requests; event long-polls are bounded by `waitMs`).
 - Error codes are stable lowercase_underscore strings in the `error` field: `unauthorized`, `host_header_forbidden`, `unsupported_media_type`, `payload_too_large`, `workspace_not_open`, `task_not_found`, `unavailable_host`, `not_found`, `method_not_allowed`, `bad_request`.
 
@@ -43,5 +43,5 @@ Opt-in via a config file read once at startup:
 - The switch file is read once at startup.
 - Remote workspaces (non-empty `workspaceIdentity`) are not supported by this API in this version; they behave like unopened workspaces (`409`).
 - Permission approvals are intentionally not exposed; `permission.requested` events only carry a summary, and the GUI remains the approval surface.
-- The event buffer lives in the owning window Host. If a workspace moves to another window after a task was created, the new Host's buffer starts empty and clients receive `{resync:true}` until they re-sync from the task snapshot.
+- The event buffer lives in the owning window Host and is not persisted: after an app restart (or when a workspace moves to another window) the buffer starts empty — long-poll clients see no events until the next one, and should re-sync from `GET /api/tasks/:taskId` (with `?workspacePath=` on the first call after a restart).
 - Nothing about outbound bot/webhook behavior changes; this API is unrelated to the Bots feature.

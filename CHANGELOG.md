@@ -6,7 +6,7 @@
 
 ### 新增
 
-- 桌面版本机任务 API：`<应用配置目录>/local-task-api.json` 写 `{"enabled":true,"port":47821,"token":"<≥32字符>"}` 后，桌面版在 `127.0.0.1:<port>` 提供任务驱动端点（`POST /api/tasks` 建任务、`POST /api/tasks/:id/messages` 补充输入（queue/steer）、`/stop`、`GET /api/tasks/:id`、`/events` 长轮询、`GET /api/tasks?workspacePath=` 列表）；经它建的任务是普通桌面对话，多对话并行、GUI 可见可接管。`GET /health` 免鉴权；其余端点要求 `Authorization: Bearer <token>`。见 `docs/local-task-api.md`。
+- 桌面版本机任务 API：`<应用配置目录>/local-task-api.json` 写 `{"enabled":true,"port":47821,"token":"<≥32字符>"}` 后，桌面版在 `127.0.0.1:<port>` 提供任务驱动端点（`POST /api/tasks` 建任务、`POST /api/tasks/:id/messages` 补充输入（queue/steer）、`/stop`、`GET /api/tasks/:id`、`/events` 长轮询、`GET /api/tasks?workspacePath=` 列表）；经它建的任务是普通桌面对话，多对话并行、GUI 可见可接管。`GET /health` 免鉴权；其余端点要求 `Authorization: Bearer <token>`。带 :taskId 的端点接受可选 `workspacePath`（GET query / POST body）：重启后首请求带它即可由 Host 校验任务归属并回填路由表，恢复接续。见 `docs/local-task-api.md`。
 
 ### 变更
 
