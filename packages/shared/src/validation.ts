@@ -959,6 +959,33 @@ export type HostResourceUsageSnapshotRequestMessage = z.infer<
   typeof hostResourceUsageSnapshotRequestMessageSchema
 >;
 
+/** 本机 Webhook Bot 入站回调转发：Host 把 rawBody 原文交给 services 共享处理函数解析，不在消息层重复解析。 */
+export const hostBotWebhookIngressDispatchMessageSchema = z
+  .object({
+    type: z.literal("bot-webhook-ingress-dispatch"),
+    requestId: nonEmptyStringSchema,
+    botId: z.string().min(1).nullable(),
+    rawBody: z.string(),
+    webhookSecret: z.string().nullable(),
+  })
+  .strict();
+export type HostBotWebhookIngressDispatchMessage = z.infer<
+  typeof hostBotWebhookIngressDispatchMessageSchema
+>;
+
+export const hostBotWebhookIngressResultResponseSchema = z
+  .object({
+    type: z.literal("bot-webhook-ingress-result"),
+    requestId: nonEmptyStringSchema,
+    ok: z.boolean(),
+    status: z.number().int().min(200).max(599),
+    body: z.unknown(),
+  })
+  .strict();
+export type HostBotWebhookIngressResultResponse = z.infer<
+  typeof hostBotWebhookIngressResultResponseSchema
+>;
+
 export const hostIncomingMessageSchema = z.discriminatedUnion("type", [
   hostPrepareProjectWorkspaceMessageSchema,
   z.object({ type: z.literal("network-capture"), control: networkCaptureControlSchema }).strict(),
@@ -995,6 +1022,7 @@ export const hostIncomingMessageSchema = z.discriminatedUnion("type", [
   hostCuaPipFocusChangedMessageSchema,
   hostApplicationLocaleChangedMessageSchema,
   hostProviderProvisioningExecuteMessageSchema,
+  hostBotWebhookIngressDispatchMessageSchema,
 ]);
 
 export const hostRemoteWorkspaceConnectedResponseSchema = z
@@ -1614,6 +1642,7 @@ export const hostResponseMessageSchema = z.discriminatedUnion("type", [
   hostOffPeakRunResultResponseSchema,
   hostCronSchedulerWakeRequestResponseSchema,
   hostOffPeakSchedulerWakeRequestResponseSchema,
+  hostBotWebhookIngressResultResponseSchema,
 ]);
 
 export const zcodeTaskPersistStatusSchema = z.enum(["running", "completed", "error"]);

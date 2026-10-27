@@ -661,6 +661,8 @@ export const HostMessageTypes = {
   NetworkCapture: "network-capture",
   /** main → host：Main 的实时界面语言变化（Host 用于 ZCode endpoint 的 X-Client-Language） */
   ApplicationLocaleChanged: "application-locale-changed",
+  /** main → host：本机 Webhook Bot 入站回调转发给窗口 Host 内的 bots 服务处理，按 requestId 应答 */
+  BotWebhookIngressDispatch: "bot-webhook-ingress-dispatch",
 } as const;
 
 /** host process → main process 的反馈消息类型 */
@@ -763,6 +765,8 @@ export const HostResponseTypes = {
   ProviderProvisioningSourceChanged: "provider-provisioning-source-changed",
   /** host → main：一次 Remote Environment 同步执行完毕。 */
   ProviderProvisioningExecutionResult: "provider-provisioning-execution-result",
+  /** host → main：本机 Webhook Bot 入站回调处理结果（status/body 透传，按 requestId 关联） */
+  BotWebhookIngressResult: "bot-webhook-ingress-result",
 } as const;
 
 // ============================================================================
