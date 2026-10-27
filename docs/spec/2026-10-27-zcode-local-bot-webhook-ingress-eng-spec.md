@@ -117,12 +117,11 @@ authority_refs:
 - **main→host 消息** `BotWebhookIngressDispatch`（进 `HostMessageTypes`，channels.ts）：
   ```ts
   { type: "bot-webhook-ingress-dispatch", requestId: string,
-    botId: string | null,            // 路径段；无则 null（botId 已并入 bodyPayload）
+    botId: string | null,            // 路径段；无则 null（botId 需在 body）
     rawBody: string,                 // 请求 body 原文（UTF-8 文本，与 Web 服务 c.req.text() 等价）
-    webhookSecret: string | null,    // x-zcode-bot-secret 头，缺省 null
-    bodyPayload: Record<string, unknown> | { payload: string } | null }
+    webhookSecret: string | null }   // x-zcode-bot-secret 头，缺省 null
   ```
-  `bodyPayload` 是 Main 按公共函数相同的解析规则（JSON.parse，失败 → `{payload: rawBody}`）预解析的结果，Host 不重复解析。`botId` 非空时 Host 侧并入 payload。
+  Host 把 `rawBody` 原文交给公共函数解析（解析逻辑只存在于公共函数一处，消息层不做预解析副本）。
 - **host→main 应答** `BotWebhookIngressResult`（进 `HostResponseTypes`）：
   ```ts
   { type: "bot-webhook-ingress-result", requestId: string,
