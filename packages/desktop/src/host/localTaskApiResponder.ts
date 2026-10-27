@@ -49,7 +49,8 @@ const MAX_EVENTS_PER_TASK = 500;
 interface TaskEventBuffer {
   seq: number;
   events: LocalTaskApiEvent[]; // 已按 seq 升序，超上限丢最老
-  waiters: Array<(result: LocalTaskApiEventsResult) => void>;
+  /** 挂起中的长轮询：各记自己的 after 水位，唤醒时只投递它没读过的事件。 */
+  waiters: Array<{ resolve: (result: LocalTaskApiEventsResult) => void; after: number }>;
   subscriptions: Array<{ dispose(): void }>; // onDynamicTaskEvent + onDynamicTaskTerminalOutcome 的退订句柄
   /** 上一次 turn.failed 的投递时刻；1 秒内的重复 failed（流事件 + 终态）只发一次。 */
   lastFailedAt?: number;
@@ -81,8 +82,13 @@ export function createLocalTaskApiResponder(deps: {
   function notifyWaiters(buffer: TaskEventBuffer): void {
     const waiters = buffer.waiters.splice(0, buffer.waiters.length);
     if (waiters.length === 0) return;
-    const result: LocalTaskApiEventsResult = { events: [...buffer.events], nextSeq: buffer.seq };
-    for (const waiter of waiters) waiter(result);
+    // 每个 waiter 按它自己的 after 过滤：只投递它没读过的事件（buffer 满重发整段时不再带上已读重复）。
+    for (const waiter of waiters) {
+      waiter.resolve({
+        events: buffer.events.filter((event) => event.seq > waiter.after),
+        nextSeq: buffer.seq,
+      });
+    }
   }
 
   /** buffer 不存在则忽略（未订阅的任务不缓冲）。 */
@@ -222,6 +228,7 @@ export function createLocalTaskApiResponder(deps: {
         deferPersistenceUntilFirstPrompt: true,
         ...(op.mode ? { mode: op.mode } : {}),
       });
+      let renameFailed = false;
       if (op.title) {
         try {
           await taskService.renameTask({
@@ -229,8 +236,14 @@ export function createLocalTaskApiResponder(deps: {
             workspacePath: op.workspacePath,
             title: op.title,
           });
-        } catch {
-          // 改名失败不致命：继续发送首条 prompt
+        } catch (error) {
+          // 改名失败不致命：继续发送首条 prompt，warning 告知调用方。
+          renameFailed = true;
+          deps.log?.(
+            `local task api: rename failed after create (taskId=${created.taskId}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
       // 任务已建成：订阅失败不回滚 create、也不让整体 503；后续首次 events 调用会懒订阅兜底。
@@ -244,6 +257,7 @@ export function createLocalTaskApiResponder(deps: {
         );
       }
       // 首条 prompt 失败也不吞 taskId：任务已建（副作用可见、可接续），warning 告知调用方。
+      let firstPromptFailed = false;
       try {
         await taskService.sendPrompt({
           taskId: created.taskId,
@@ -252,14 +266,16 @@ export function createLocalTaskApiResponder(deps: {
           clientMode: "desktop-continuous",
         });
       } catch (error) {
+        firstPromptFailed = true;
         deps.log?.(
           `local task api: first prompt failed (taskId=${created.taskId}): ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        return { status: 201, body: { taskId: created.taskId, warning: "first_prompt_failed" } };
       }
-      return { status: 201, body: { taskId: created.taskId } };
+      // warning 按严重度只取一：首条 prompt 失败重于改名失败。
+      const warning = firstPromptFailed ? "first_prompt_failed" : renameFailed ? "rename_failed" : undefined;
+      return { status: 201, body: { taskId: created.taskId, ...(warning ? { warning } : {}) } };
     }
 
     if (op.kind === "send") {
@@ -295,16 +311,27 @@ export function createLocalTaskApiResponder(deps: {
         // 懒订阅兜底由首次 events 调用承担
       }
       if (op.delivery === "steer") {
-        await taskService.promoteTaskCommand({
-          workspacePath: op.workspacePath,
-          taskId: op.taskId,
-          commandId,
-          ownerRunId: traceId,
-          clientMode: "desktop-continuous",
-        });
-        // appendEvent 前不需要 ensureSubscriptions——任务没 buffer 就忽略，正常。
-        appendEvent(op.taskId, { type: "input.steered", commandId });
-        return { status: 202, body: { delivery: "steered", commandId } };
+        try {
+          await taskService.promoteTaskCommand({
+            workspacePath: op.workspacePath,
+            taskId: op.taskId,
+            commandId,
+            ownerRunId: traceId,
+            clientMode: "desktop-continuous",
+          });
+          // appendEvent 前不需要 ensureSubscriptions——任务没 buffer 就忽略，正常。
+          appendEvent(op.taskId, { type: "input.steered", commandId });
+          return { status: 202, body: { delivery: "steered", commandId } };
+        } catch (error) {
+          // enqueue 已成功：命令在队列里会被执行，副作用必须如实可见（与 create 部分失败同型）。
+          deps.log?.(
+            `[local-task-api] promote failed task=${op.taskId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          appendEvent(op.taskId, { type: "input.queued", commandId });
+          return { status: 202, body: { delivery: "queued", commandId, warning: "promote_failed" } };
+        }
       }
       appendEvent(op.taskId, { type: "input.queued", commandId });
       return { status: 202, body: { delivery: "queued", commandId } };
@@ -347,8 +374,17 @@ export function createLocalTaskApiResponder(deps: {
       // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
       const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
       if (!meta) return { status: 404, body: { error: "task_not_found" } };
-      // buffer 不存在时直接 ensure（新建空 buffer + 订阅），行为=从现在开始记事件。
-      const buffer = ensureSubscriptions(taskService, op.workspacePath, op.taskId);
+      // buffer 已存在走原逻辑（filter / resync 判定 / 长轮询）；不存在（含终态释放后的
+      // 懒重建）先 ensure，保证后续事件开始被收集，再按水位分流：
+      // 终态释放后 seq 从 1 重新计，after>0 的旧水位只能让客户端 resync（先 GET 对账，
+      // 再从当前 nextSeq 重新跟）；after=0 即从头开始跟，无历史承诺。
+      const existingBuffer = buffers.get(op.taskId);
+      if (!existingBuffer) {
+        ensureSubscriptions(taskService, op.workspacePath, op.taskId);
+        if (op.after > 0) return { status: 200, body: { resync: true } };
+        return { status: 200, body: { events: [], nextSeq: 0 } };
+      }
+      const buffer = existingBuffer;
       const events = buffer.events.filter((event) => event.seq > op.after);
       const nextSeq = buffer.seq;
       // 客户端落后太多（最老事件已丢弃）→ 只能整体重同步。
@@ -358,9 +394,11 @@ export function createLocalTaskApiResponder(deps: {
       if (events.length > 0) return { status: 200, body: { events, nextSeq } };
       if (op.waitMs === 0) return { status: 200, body: { events: [], nextSeq } };
       const result = await new Promise<LocalTaskApiEventsResult>((resolve) => {
-        buffer.waiters.push(resolve);
+        const waiter = { resolve, after: op.after };
+        buffer.waiters.push(waiter);
+        // 超时路径 resolve 空事件：仍挂起=没有新于 after 的事件到达（老事件请求发出时已读过）。
         setTimeout(() => {
-          const index = buffer.waiters.indexOf(resolve);
+          const index = buffer.waiters.indexOf(waiter);
           if (index >= 0) buffer.waiters.splice(index, 1);
           resolve({ events: [], nextSeq: buffer.seq });
         }, op.waitMs);

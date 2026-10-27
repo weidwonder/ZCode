@@ -585,4 +585,122 @@ describe("localTaskApiResponder", () => {
     // events 查询懒建了新 buffer（第 2 次订阅），证明旧 buffer 已被修剪释放。
     expect(mock.onDynamicTaskEvent).toHaveBeenCalledTimes(2);
   });
+
+  it("events：挂起唤醒按该请求的 after 过滤——只投新事件，不重发已读旧事件", async () => {
+    const { responder, posted, eventListeners } = createHarness();
+    await responder.handleRequest(
+      request("r0", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    eventListeners[0]!({ type: "task_run_started", turnId: "t1" });
+    eventListeners[0]!({ type: "task_run_started", turnId: "t2" });
+
+    // after=2（两条旧事件都已读过）：请求时无积压 → 真挂起；唤醒只应投第 3 条。
+    // （若 after=1 且 seq2 已在 buffer，seq2 已满足 seq>after，会在注册 waiter 前走积压即返，测不到唤醒过滤。）
+    const pending = responder.handleRequest(
+      request("r1", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 2, waitMs: 5000 }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0)); // 等挂起注册落地
+    eventListeners[0]!({ type: "task_run_started", turnId: "t3" });
+    await pending;
+
+    const body = posted.at(-1)!.body as { events: Array<{ seq: number; turnId: string }>; nextSeq: number };
+    expect(body.nextSeq).toBe(3);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0]).toMatchObject({ seq: 3, type: "turn.started", turnId: "t3" });
+    expect(body.events.some((event) => event.seq <= 2)).toBe(false);
+  }, 8000);
+
+  it("events：终态修剪懒重建后 after>0 → resync；after=0 → 从 0 开始跟", async () => {
+    const { responder, posted, eventListeners, terminalListeners } = createHarness();
+
+    await responder.handleRequest(
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
+    );
+    eventListeners[0]!({ type: "task_run_started", turnId: "t1" });
+    terminalListeners[0]!({ outcome: "succeeded" });
+    await new Promise((resolve) => setTimeout(resolve, 30)); // terminalPruneDelayMs=10，确保修剪已落地
+
+    // 旧 buffer 已整体释放、seq 历史作废：旧水位 after=1 只能 resync（先 ensure 新 buffer 收集后续事件）。
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 1, waitMs: 0 }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 200, body: { resync: true } });
+
+    // after=0：新 buffer 已存在（上一次调用懒建），从 0 开始跟。
+    await responder.handleRequest(
+      request("r3", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 200, body: { events: [], nextSeq: 0 } });
+  });
+
+  it("send steer：promote 失败仍 202 + delivery=queued + warning=promote_failed，事件记 input.queued", async () => {
+    const { responder, posted, mock, log } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
+    // 先经 events op 懒订阅建 buffer，input.queued 才能进事件流。
+    await responder.handleRequest(
+      request("r0", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    mock.promoteTaskCommand.mockImplementation(async () => {
+      throw new Error("promote exploded");
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "steer",
+      }),
+    );
+
+    // enqueue 已成功：命令会被执行，受理必须可见——不能 503、不能没有事件。
+    expect(mock.enqueueTaskCommand).toHaveBeenCalledTimes(1);
+    const body = posted.at(-1)!.body as { delivery: string; commandId: string; warning?: string };
+    expect(body.delivery).toBe("queued");
+    expect(body.warning).toBe("promote_failed");
+    expect(body.commandId).toBeTruthy();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("promote exploded"));
+
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> }).events;
+    expect(events.some((event) => event.type === "input.steered")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "input.queued", commandId: body.commandId });
+  });
+
+  it("create：renameTask 失败 → 201 + warning=rename_failed；与首条 prompt 同败时 first_prompt_failed 优先", async () => {
+    const renamed = createHarness({
+      renameTask: vi.fn(async () => {
+        throw new Error("rename rejected");
+      }),
+    });
+    await renamed.responder.handleRequest(
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T" }),
+    );
+    expect(renamed.posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 201,
+      body: { taskId: TASK_ID, warning: "rename_failed" },
+    });
+    expect(renamed.log).toHaveBeenCalledWith(expect.stringContaining("rename rejected"));
+
+    const both = createHarness({
+      renameTask: vi.fn(async () => {
+        throw new Error("rename rejected");
+      }),
+      sendPrompt: vi.fn(async () => {
+        throw new Error("prompt rejected");
+      }),
+    });
+    await both.responder.handleRequest(
+      request("r2", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T" }),
+    );
+    expect(both.posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 201,
+      body: { taskId: TASK_ID, warning: "first_prompt_failed" },
+    });
+  });
 });
