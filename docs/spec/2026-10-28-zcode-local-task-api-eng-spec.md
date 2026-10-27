@@ -106,6 +106,7 @@ authority_refs:
 | FR-012 | Host responder 用真实 `IZCodeTaskService` 类型（`Pick` 面）；上游签名变化编译失败。 |
 | FR-013 | 日志：生命周期 info + 拒绝原因计数（401/403/415/413/409/503 各计数）；请求体/prompt/token 不落日志。 |
 | FR-014 | 上游文档 `docs/local-task-api.md`（英文）+ dw 产物同步（卡片、CHANGELOG、决策记录）。 |
+| FR-015 | 带 :taskId 的端点（messages/stop/get/events）接受可选 workspacePath（GET 用 query `?workspacePath=`，POST 放 body）：归属表命中照旧；未命中且带了 workspacePath → 按该工作区路由，Host 用 `getTaskMeta({taskId, workspacePath})`（`zcodeTaskService.ts:526-530`，null 即不属于/不存在 → 404）校验，应答 2xx 时 Main 回填归属表；未命中且未带 → 404。events 缓冲重启后为空是预期（空事件 + 当前 nextSeq，客户端用 GET task 取状态）。 |
 
 ## 2. 数据模型 / 数据结构
 
@@ -147,11 +148,13 @@ authority_refs:
 |---|---|---|---|
 | GET /health | — | 200 见 FR-003 | 无 |
 | POST /api/tasks | `{workspacePath, prompt, mode?, title?}` | 201 `{taskId}` / 409 | Bearer |
-| POST /api/tasks/:id/messages | `{text, delivery?}` | 202 `{delivery, commandId?}` / 404 / 409 | Bearer |
-| POST /api/tasks/:id/stop | — | 202 `{ok:true}` / 404 / 409 | Bearer |
-| GET /api/tasks/:id | — | 200 任务摘要 / 404 / 409 | Bearer |
-| GET /api/tasks/:id/events | `after`, `waitMs` | 200 `{events,nextSeq}` 或 `{resync:true}` / 404 / 409 | Bearer |
+| POST /api/tasks/:id/messages | `{text, delivery?, workspacePath?}` | 202 `{delivery, commandId?}` / 404 / 409 | Bearer |
+| POST /api/tasks/:id/stop | body 可选 `{workspacePath?}` | 202 `{ok:true}` / 404 / 409 | Bearer |
+| GET /api/tasks/:id | query 可选 `?workspacePath=` | 200 任务摘要 / 404 / 409 | Bearer |
+| GET /api/tasks/:id/events | `after`, `waitMs`, query 可选 `?workspacePath=` | 200 `{events,nextSeq}` 或 `{resync:true}` / 404 / 409 | Bearer |
 | GET /api/tasks?workspacePath= | query | 200 `{tasks:[…]}` / 409 | Bearer |
+
+> `workspacePath`（可选）的语义（FR-015）：归属表未命中时的重新锚定入口——Host 用 `getTaskMeta` 核实任务确属该工作区，2xx 应答即回填归属表，之后的请求可省略。
 
 **错误码**（HTTP + `error` 字段，lowercase_underscore）：`unauthorized`（401）、`host_header_forbidden`（403）、`unsupported_media_type`（415）、`payload_too_large`（413）、`workspace_not_open`（409）、`task_not_found`（404）、`unavailable_host`（503）、`not_found`/`method_not_allowed`。
 
@@ -180,6 +183,7 @@ authority_refs:
 4. **send op**：`listActiveTaskIds` 判运行；空闲 → `sendPrompt({taskId, traceId: 新 randomUUID(), content, clientMode:"desktop-continuous"})` → `{delivery:"sent"}`；运行 → `enqueueTaskCommand({workspacePath, taskId, commandId: 新 randomUUID(), traceId: 新 randomUUID(), type:"send_prompt", content})`；steer 再 `promoteTaskCommand({workspacePath, taskId, commandId, ownerRunId: 同 traceId, clientMode:"desktop-continuous"})`；成功后投 input.queued/input.steered 事件。
 5. **events 长轮询**：buffer 命中 `seq>after` 立即返回；`after < oldestSeq-1`（且 after>0）→ `{resync:true}`；否则挂 waiter 至 waitMs 或新事件（waiter 用 notifier Promise，Host 不落盘）。
 6. **Main 路由**：`resolveHostByWorkspace(path)` 遍历 taskRealtimeBus hosts 注册表的 `workspaceKeys`（key = workspacePath，本地 workspace identity 为空）取 `child`（utilityProcess 直接可 postMessage）；无 → 409。dispatcher 复用 v1 形态（requestId + pending Map + 300s 兜底——events 的 waitMs≤30s 远小于兜底）。
+7. **taskId 重锚定（FR-015）**：Main 的 `resolveTaskWorkspace`——归属表命中用表值；未命中且请求带非空 workspacePath 用该值路由，Host 在 send/stop/events op 前置 `getTaskMeta({taskId, workspacePath})` 校验（null → 404，不调任何写操作；get op 的 getTaskSnapshot null 同效），Main 收到 2xx 应答且该请求未走表时回填 `taskWorkspaceByTaskId`。重启后首个请求带 workspacePath 即恢复接续（事件缓冲为空，GET task 可取全量状态）。
 7. **鉴权**：`sha256(configToken)` vs `sha256(headerToken)` 后 `crypto.timingSafeEqual`。
 
 **设计自检**：新消息对（跨进程必需，FR-011/012）；Host 事件 buffer（Main 不承载业务状态——AGENTS.md；FR-009）；Main 归属表（taskId 无 workspace 反查接口，HTTP URL 又只有 taskId——FR-011）；409 而非自动打开（A2：自动打开需 createWindow+renderer 开 tab+等上报，时机不确定；409 查表即答）。**备选方案**：事件 buffer 放 Main（否——业务状态进 Main 违反仓库架构）；按 taskId 广播全 Host 解析 workspace（否——无接口支撑且时序不定）。
@@ -246,8 +250,9 @@ authority_refs:
 | AC-005 | 上游文档 + dw 产物（卡片/CHANGELOG/决策记录/v1 spec 转 superseded） | FR-014 |
 | AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规） | — |
 | AC-007 | 日志断言：拒绝路径计数、无 prompt 内容 | FR-013 |
+| AC-008 | 重锚定测试：重启（表空）后带 workspacePath 续聊成功且回填（后续请求可省略）；带错 workspacePath 404 透传且不回填；不带 404；Host 侧 send/stop/events 对不属于该 workspace 的任务 404 且不触发写操作 | FR-015 |
 
-**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003；FR-006→AC-003；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007；FR-014→AC-005。
+**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003；FR-006→AC-003；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007；FR-014→AC-005；FR-015→AC-008。
 
 ## 12. 契约偏离（对上级契约 v2 文本；最终总结会重复列出）
 
@@ -256,7 +261,7 @@ authority_refs:
 | 1 | `turnCount` = snapshot.messages 中 assistant 条数 | `ZCodeTaskMeta` 无原生 turnCount 字段（zcode-task-types-core.ts:276-363） |
 | 2 | `steer` = enqueueTaskCommand + promoteTaskCommand 近似 | IZCodeTaskService 无 CLI v4 的 guide delivery；promote（抢跑）是旧栈最接近 steer 的原语 |
 | 3 | stopped 终态 → `turn.completed`（text 空） | 契约事件闭集无 stopped 类型 |
-| 4 | ZCode 重启后旧 taskId → 404（非本 API 创建的任务同理） | Main 归属表进程内存；tasks-index 无按 taskId 反查 workspace 的服务接口；行为确定优先 |
+| 4 | ZCode 重启后旧 taskId 需在首个请求带 `workspacePath` 重新锚定（Host `getTaskMeta` 校验后回填归属表），不带则 404；events 缓冲重启后为空 | tasks-index 无按 taskId 反查 workspace 的服务接口；getTaskMeta 按 workspace 校验是现成原语。已按上级 2026-10-28 追加要求从「直接 404」升级为可选重锚定 |
 | 5 | workspace 未打开 → 409（不自动打开） | 契约第 10 条二选一；自动打开链长时机不定（A2 调查） |
 | 6 | workspaceIdentity 非空（远端 workspace）→ 409 | v2 只做本地 workspace；路由表 workspaceKeys 只含本地 |
 | 7 | 检查顺序：Host 头(403) → Bearer(401) → Content-Type(415) → 大小(413) | DNS rebinding 防护先于鉴权；契约未定顺序 |

@@ -13,7 +13,8 @@
 | 流事件类型判别（turn/权限/完成/失败） | `packages/shared/src/zcode-task-types-core.ts#ZCodeStreamEvent` | 内部 | canonical | 事件投影 | task_run_started/task_complete/task_error/permission_request 是粗粒度投影源 |
 | workspace→Host 路由数据源 | `packages/desktop/src/main/taskRealtimeBus.ts#TaskRealtimeBus`（hosts 注册表） | 内部 | canonical | Main 路由函数 | workspaceKey = workspaceIdentity?.trim() \|\| workspacePath；renderer 经 SyncWindowTabs 上报（desktopMainIpcPlatform.ts） |
 | Main 监听与鉴权 | `packages/desktop/src/main/localTaskApi.ts#createLocalTaskApi` | HTTP(loopback) | v2 | 桥接程序 | 开关文件 local-task-api.json（enabled/port/token≥32）；Host 头→Bearer(sha256+timingSafeEqual)→Content-Type→16MiB |
-| Host 应答器（六 op + 事件 ring buffer） | `packages/desktop/src/host/localTaskApiResponder.ts#createLocalTaskApiResponder` | 内部 | v2 | Main 转发 | buffer 每任务 500 条；resync 语义；事件缓冲在 Host（Main 不承载业务状态） |
+| taskId 重锚定（重启后接续） | Main 侧 `resolveTaskWorkspace`（同上文件）；Host 校验用 `packages/services/src/session/zcodeTaskService.ts#IZCodeTaskService` 的 getTaskMeta | 内部 | v2 | 桥接程序 | 归属表未命中 + 请求带 workspacePath → Host getTaskMeta 核实（null→404）→ 2xx 回填归属表；未命中未带 → 404 |
+| Host 应答器（六 op + 事件 ring buffer） | `packages/desktop/src/host/localTaskApiResponder.ts#createLocalTaskApiResponder` | 内部 | v2 | Main 转发 | buffer 每任务 500 条；resync 语义；事件缓冲在 Host（Main 不承载业务状态）；send/stop/events 前置 getTaskMeta 归属校验 |
 
 ## 陷阱项
 
