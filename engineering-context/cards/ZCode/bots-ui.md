@@ -8,8 +8,8 @@ Bots 设置对话框（共享 UI 包）的 provider 列表、provider 设置卡�
 | 能力 / 入口 | 权威实现（cite） | 类型 | 版本 / 状态 | 调用方 / 触发源 | 约束 |
 |---|---|---|---|---|---|
 | provider 清单与 implemented 标记 | `packages/ui/src/botsUi.ts#BOT_PROVIDERS` | 内部 | canonical | BotsDialog | webhook 已 implemented:true |
-| 新建 bot 列表渲染 | `packages/ui/src/BotsDialog.tsx`（creatingBot 分支） | 内部 | canonical | 用户 | 桌面曾把 webhook 过滤（本分支放开，与 docs/bots.md「Webhook setup is available from the new bot provider list」声明对齐） |
-| provider 凭据设置卡 | `packages/ui/src/BotsDialog/ProviderSettingsCard.tsx#ProviderSettingsCard` | 内部 | canonical | BotsDialog | webhook 分支曾 return null（本分支改为 webhook 设置卡）；secret 保存走 saveBot 的 webhookSecretValue |
+| 新建 bot 列表渲染 | `packages/ui/src/BotsDialog.tsx`（creatingBot 分支） | 内部 | canonical | 用户 | webhook 被 filter 掉（与 docs/bots.md「Webhook setup is available from the new bot provider list」声明不一致是既有状态；曾随 v1 方案放开过，回退后维持原样） |
+| provider 凭据设置卡 | `packages/ui/src/BotsDialog/ProviderSettingsCard.tsx#ProviderSettingsCard` | 内部 | canonical | BotsDialog | webhook 分支 return null；secret 保存接口 saveBot 的 webhookSecretValue 参数存在（BotSaveBotParams）但 UI 未接 |
 | UI 保存路径 | `packages/ui/src/BotsDialog.tsx#saveBot`（→ botsService.saveBot） | RPC | canonical | BotsDialog | 服务端 BotSaveBotParams 含 credentialValue 与 webhookSecretValue 两个独立参数 |
 | UI 服务获取 | `packages/ui/src/hooks/useServices.tsx#useServices` | 内部 | canonical | UI 组件 | React Context 注入 IServiceAccessor |
 

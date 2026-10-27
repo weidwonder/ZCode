@@ -1,8 +1,8 @@
 ---
-lifecycle: active
-superseded_by: ''
-archived: ''
-last_confirmed: '2026-10-27'
+lifecycle: superseded
+superseded_by: '2026-10-28-zcode-local-task-api-eng-spec.md'
+archived: '2026-10-28'
+last_confirmed: '2026-10-28'
 authority_refs:
   - '桌面版本机入站端点 POST /api/bots/webhook(/:botId) 行为契约（见 docs/bot-webhook-ingress.md）'
   - '开关文件 bot-webhook-ingress.json 的读取语义（enabled/port）'

@@ -13,6 +13,7 @@ ZCode 桌面版（Electron）+ Web 服务 + 共享 services/UI 的 monorepo：Ag
 |---|---|---|
 | bots-webhook-callback | Webhook Bot 入站回调的解析、鉴权与状态码语义 | `cards/ZCode/bots-webhook-callback.md` |
 | desktop-host-ipc | Main ↔ window Local Host 进程间消息协议与请求转发 | `cards/ZCode/desktop-host-ipc.md` |
+| local-task-api | 桌面版本机任务 API（loopback HTTP → 窗口 Host 的任务服务） | `cards/ZCode/local-task-api.md` |
 | bots-ui | Bots 设置对话框的 provider 列表与凭据保存路径 | `cards/ZCode/bots-ui.md` |
 
 ## 对外入口总览
@@ -20,7 +21,7 @@ ZCode 桌面版（Electron）+ Web 服务 + 共享 services/UI 的 monorepo：Ag
 | 入口 | 类型 | 归属域 |
 |---|---|---|
 | POST /api/bots/:provider(/:botId)（Web 服务） | HTTP | bots-webhook-callback |
-| GET /health 与 POST /api/bots/webhook(/:botId)（桌面版本机入站） | HTTP（loopback） | bots-webhook-callback |
+| GET /health 与 /api/tasks*（桌面版本机任务 API，opt-in） | HTTP（loopback） | local-task-api |
 
 ## 确认
 2026-10-27｜来源：packages/services/src/bots/、packages/desktop/src/main/index.ts、packages/desktop/src/host/index.ts、packages/server/src/http.ts、packages/ui/src/BotsDialog*.tsx
