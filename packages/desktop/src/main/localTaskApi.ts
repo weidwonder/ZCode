@@ -145,7 +145,11 @@ export interface LocalTaskApiDeps {
 
 /**
  * 创建本机任务 API 监听。返回 null 表示未监听（未启用/配置无效/端口被占），调用方继续正常启动。
- * 归属表 taskId→workspacePath 是本模块的进程内存状态：只有经本 API 创建的任务可被后续 op 路由。
+ * 归属表 taskId→workspacePath 是本模块的进程内存状态：只有经本 API 创建的任务登记入表；
+ * 重启后表为空，带 :taskId 的请求可携带可选 workspacePath（GET 用 query、POST 用 body
+ * 字段）按 workspace 路由，由 Host 校验任务归属、应答 2xx 后回填本表；表未命中且未带
+ * 则 404 task_not_found。events 缓冲随重启清空：重启后先查 events 返回空事件 + nextSeq
+ * 是预期行为。
  */
 export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server | null> {
   const dispatcher = createLocalTaskApiDispatcher({ resolveHost: deps.resolveHost });
@@ -261,25 +265,35 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     return typeof value === "string" && value.length > 0 ? value : null;
   }
 
-  function requireOwnedTask(res: ServerResponse, taskId: string): string | null {
-    const workspacePath = taskWorkspaceByTaskId.get(taskId);
-    if (!workspacePath) {
-      rejected.taskNotFound += 1;
-      sendJson(res, 404, { error: "task_not_found" });
-      return null;
-    }
-    return workspacePath;
+  function resolveTaskWorkspace(
+    res: ServerResponse,
+    taskId: string,
+    provided?: string | null,
+  ): string | null {
+    const owned = taskWorkspaceByTaskId.get(taskId);
+    if (owned) return owned;
+    // 归属表未命中但请求带了 workspacePath：按它路由，由 Host 校验任务归属；
+    // 应答 2xx 时回填归属表（调用方在 dispatch 后做）。
+    if (typeof provided === "string" && provided.length > 0) return provided;
+    rejected.taskNotFound += 1;
+    sendJson(res, 404, { error: "task_not_found" });
+    return null;
   }
 
   async function dispatchOp(
     res: ServerResponse,
     workspacePath: string,
     op: LocalTaskApiRequestOp,
+    options?: { rememberTask?: { taskId: string; workspacePath: string } },
   ): Promise<void> {
     try {
       const result = await dispatcher.dispatch(workspacePath, op);
       if (result.status === 409) {
         rejected.workspaceNotOpen += 1;
+      }
+      // Host 校验通过（2xx）才回填：外部提供的 workspacePath 从此成为权威归属。
+      if (options?.rememberTask && result.status >= 200 && result.status < 300) {
+        taskWorkspaceByTaskId.set(options.rememberTask.taskId, options.rememberTask.workspacePath);
       }
       sendJson(res, result.status, result.body);
     } catch {
@@ -348,11 +362,18 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
-      const workspacePath = requireOwnedTask(res, taskId);
+      const providedWorkspace = url.searchParams.get("workspacePath");
+      const workspacePath = resolveTaskWorkspace(res, taskId, providedWorkspace);
       if (workspacePath === null) return;
+      const wasOwned = taskWorkspaceByTaskId.has(taskId);
       const after = parseAfter(url.searchParams.get("after"));
       const waitMs = parseWaitMs(url.searchParams.get("waitMs"));
-      await dispatchOp(res, workspacePath, { kind: "events", workspacePath, taskId, after, waitMs });
+      await dispatchOp(
+        res,
+        workspacePath,
+        { kind: "events", workspacePath, taskId, after, waitMs },
+        wasOwned ? undefined : { rememberTask: { taskId, workspacePath } },
+      );
       return;
     }
 
@@ -372,9 +393,16 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
-      const workspacePath = requireOwnedTask(res, taskId);
+      const providedWorkspace = url.searchParams.get("workspacePath");
+      const workspacePath = resolveTaskWorkspace(res, taskId, providedWorkspace);
       if (workspacePath === null) return;
-      await dispatchOp(res, workspacePath, { kind: "get", workspacePath, taskId });
+      const wasOwned = taskWorkspaceByTaskId.has(taskId);
+      await dispatchOp(
+        res,
+        workspacePath,
+        { kind: "get", workspacePath, taskId },
+        wasOwned ? undefined : { rememberTask: { taskId, workspacePath } },
+      );
       return;
     }
 
@@ -491,12 +519,41 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       sendJson(res, 404, { error: "not_found" });
       return;
     }
-    const workspacePath = requireOwnedTask(res, taskId);
-    if (workspacePath === null) return;
 
     if (isStop) {
-      // stop：空 body 放行，不 parse。
-      await dispatchOp(res, workspacePath, { kind: "stop", workspacePath, taskId });
+      // stop：空 body 放行不 parse；带 body 时取可选 workspacePath（类型错 → 400）。
+      let providedWorkspace: string | null = null;
+      if (body.text.length > 0) {
+        let parsedStop: unknown;
+        try {
+          parsedStop = JSON.parse(body.text);
+        } catch {
+          sendJson(res, 400, { error: "bad_request" });
+          return;
+        }
+        if (!isRecord(parsedStop)) {
+          sendJson(res, 400, { error: "bad_request" });
+          return;
+        }
+        if (
+          parsedStop["workspacePath"] !== undefined &&
+          typeof parsedStop["workspacePath"] !== "string"
+        ) {
+          sendJson(res, 400, { error: "bad_request" });
+          return;
+        }
+        providedWorkspace =
+          typeof parsedStop["workspacePath"] === "string" ? parsedStop["workspacePath"] : null;
+      }
+      const workspacePath = resolveTaskWorkspace(res, taskId, providedWorkspace);
+      if (workspacePath === null) return;
+      const wasOwned = taskWorkspaceByTaskId.has(taskId);
+      await dispatchOp(
+        res,
+        workspacePath,
+        { kind: "stop", workspacePath, taskId },
+        wasOwned ? undefined : { rememberTask: { taskId, workspacePath } },
+      );
       return;
     }
 
@@ -511,6 +568,12 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       sendJson(res, 400, { error: "bad_request" });
       return;
     }
+    if (parsed["workspacePath"] !== undefined && typeof parsed["workspacePath"] !== "string") {
+      sendJson(res, 400, { error: "bad_request" });
+      return;
+    }
+    const providedWorkspace =
+      typeof parsed["workspacePath"] === "string" ? parsed["workspacePath"] : null;
     const text = parsed["text"];
     const delivery = parsed["delivery"];
     if (
@@ -523,13 +586,21 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       sendJson(res, 400, { error: "bad_request" });
       return;
     }
-    await dispatchOp(res, workspacePath, {
-      kind: "send",
+    const workspacePath = resolveTaskWorkspace(res, taskId, providedWorkspace);
+    if (workspacePath === null) return;
+    const wasOwned = taskWorkspaceByTaskId.has(taskId);
+    await dispatchOp(
+      res,
       workspacePath,
-      taskId,
-      text,
-      delivery: delivery ?? "auto",
-    });
+      {
+        kind: "send",
+        workspacePath,
+        taskId,
+        text,
+        delivery: delivery ?? "auto",
+      },
+      wasOwned ? undefined : { rememberTask: { taskId, workspacePath } },
+    );
   }
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse, port_: number): Promise<void> {

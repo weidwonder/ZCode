@@ -51,6 +51,18 @@ function capturingResolveHost(captured: HostLocalTaskApiRequestMessage[]) {
   };
 }
 
+/** 同上，但放行一组 workspace（归属表未命中时按 provided workspacePath 路由的用例需要）。 */
+function capturingResolveHostFor(workspaces: string[], captured: HostLocalTaskApiRequestMessage[]) {
+  return (workspacePath: string) => {
+    if (!workspaces.includes(workspacePath)) return null;
+    return {
+      postMessage: (message: unknown) => {
+        captured.push(message as HostLocalTaskApiRequestMessage);
+      },
+    };
+  };
+}
+
 async function startServer(
   overrides: {
     readConfig?: () => Promise<LocalTaskApiConfig | null | "invalid">;
@@ -614,6 +626,172 @@ describe("localTaskApi", () => {
     const res = await stopP;
     expect(res.status).toBe(202);
     expect(JSON.parse(res.text)).toEqual({ ok: true });
+  });
+
+  it("重启后归属表为空：messages 带 workspacePath 路由成功并回填，后续 stop 不带也能路由", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/w/old"], captured),
+    });
+
+    const sendP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/t-old/messages",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ text: "hi", workspacePath: "/w/old" }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({
+      kind: "send",
+      workspacePath: "/w/old",
+      taskId: "t-old",
+      text: "hi",
+      delivery: "auto",
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c1" },
+    });
+    const first = await sendP;
+    expect(first.status).toBe(202);
+    expect(JSON.parse(first.text)).toEqual({ delivery: "queued", commandId: "c1" });
+
+    // 回填生效：同一 server 再发 stop（不带 workspacePath）仍路由到 /w/old。
+    const stopP = send({
+      port,
+      method: "POST",
+      path: "/api/tasks/t-old/stop",
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 2);
+    expect(captured[1].op).toEqual({ kind: "stop", workspacePath: "/w/old", taskId: "t-old" });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 202,
+      body: { ok: true },
+    });
+    expect((await stopP).status).toBe(202);
+  });
+
+  it("带错 workspacePath：Host 回 404 透传且不回填，后续不带 workspacePath 仍 404", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/w/wrong"], captured),
+    });
+
+    const sendP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/t-x/messages",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ text: "x", workspacePath: "/w/wrong" }),
+    );
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 404,
+      body: { error: "task_not_found" },
+    });
+    const first = await sendP;
+    expect(first.status).toBe(404);
+    expect(JSON.parse(first.text)).toEqual({ error: "task_not_found" });
+
+    const again = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/t-x/messages",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ text: "x" }),
+    );
+    expect(again.status).toBe(404);
+    expect(JSON.parse(again.text)).toEqual({ error: "task_not_found" });
+    expect(captured).toHaveLength(1); // 未回填：第二次没有 dispatch
+  });
+
+  it("GET events 接受 ?workspacePath= 并回填，后续 get 不带也能路由", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/w/e"], captured),
+    });
+
+    const eventsP = send({
+      port,
+      path: `/api/tasks/t-e/events?workspacePath=${encodeURIComponent("/w/e")}&after=0&waitMs=0`,
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({
+      kind: "events",
+      workspacePath: "/w/e",
+      taskId: "t-e",
+      after: 0,
+      waitMs: 0,
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { events: [], nextSeq: 0 },
+    });
+    expect((await eventsP).status).toBe(200);
+
+    // 回填生效：不带 workspacePath 的 get 也按 /w/e 路由。
+    const getP = send({ port, path: "/api/tasks/t-e", headers: { authorization: BEARER } });
+    await waitForCaptured(captured, 2);
+    expect(captured[1].op).toEqual({ kind: "get", workspacePath: "/w/e", taskId: "t-e" });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 200,
+      body: { taskId: "t-e" },
+    });
+    expect((await getP).status).toBe(200);
+  });
+
+  it("stop：空 body 且表未命中 → 404；带 workspacePath body → 路由到该 workspace", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/w/s"], captured),
+    });
+
+    const empty = await send({
+      port,
+      method: "POST",
+      path: "/api/tasks/t-s/stop",
+      headers: { authorization: BEARER },
+    });
+    expect(empty.status).toBe(404);
+    expect(JSON.parse(empty.text)).toEqual({ error: "task_not_found" });
+
+    const stopP = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/t-s/stop",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/w/s" }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({ kind: "stop", workspacePath: "/w/s", taskId: "t-s" });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 202,
+      body: { ok: true },
+    });
+    expect((await stopP).status).toBe(202);
   });
 
   it("响应不带 CORS 头", async () => {

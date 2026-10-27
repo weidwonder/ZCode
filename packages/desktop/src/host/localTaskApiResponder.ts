@@ -234,6 +234,10 @@ export function createLocalTaskApiResponder(deps: {
     }
 
     if (op.kind === "send") {
+      // 归属校验：Main 侧外部提供的 workspacePath 在这里核实（getTaskMeta 按
+      // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
+      const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
+      if (!meta) return { status: 404, body: { error: "task_not_found" } };
       const active = await taskService.listActiveTaskIds({ workspacePath: op.workspacePath });
       if (!active.includes(op.taskId)) {
         await taskService.sendPrompt({
@@ -271,6 +275,10 @@ export function createLocalTaskApiResponder(deps: {
     }
 
     if (op.kind === "stop") {
+      // 归属校验：Main 侧外部提供的 workspacePath 在这里核实（getTaskMeta 按
+      // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
+      const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
+      if (!meta) return { status: 404, body: { error: "task_not_found" } };
       await taskService.stopGeneration({ taskId: op.taskId, workspacePath: op.workspacePath });
       return { status: 202, body: { ok: true } };
     }
@@ -299,6 +307,10 @@ export function createLocalTaskApiResponder(deps: {
     }
 
     if (op.kind === "events") {
+      // 归属校验：Main 侧外部提供的 workspacePath 在这里核实（getTaskMeta 按
+      // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
+      const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
+      if (!meta) return { status: 404, body: { error: "task_not_found" } };
       // buffer 不存在时直接 ensure（新建空 buffer + 订阅），行为=从现在开始记事件。
       const buffer = ensureSubscriptions(taskService, op.workspacePath, op.taskId);
       const events = buffer.events.filter((event) => event.seq > op.after);

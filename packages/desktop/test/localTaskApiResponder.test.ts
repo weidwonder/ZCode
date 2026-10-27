@@ -33,7 +33,8 @@ function createHarness(overrides: Record<string, unknown> = {}): Harness {
     promoteTaskCommand: vi.fn(async () => ({ commandId: "cmd-1" })),
     stopGeneration: vi.fn(async () => undefined),
     getTaskSnapshot: vi.fn(async () => null),
-    getTaskMeta: vi.fn(async () => null),
+    // send/stop/events op 现在先过归属校验：默认放行（meta 存在），否则三个 op 全 404。
+    getTaskMeta: vi.fn(async () => ({ taskId: TASK_ID, workspacePath: WORKSPACE }) as never),
     listTasks: vi.fn(async () => []),
     listActiveTaskIds: vi.fn(async () => [] as string[]),
     renameTask: vi.fn(async () => null),
@@ -358,6 +359,58 @@ describe("localTaskApiResponder", () => {
       status: 200,
       body: { resync: true },
     });
+  });
+
+  it("send：getTaskMeta 查不到任务 → 404 前置，不触达 sendPrompt/enqueue/listActive", async () => {
+    const { responder, posted, mock } = createHarness({
+      getTaskMeta: vi.fn(async () => null),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: "task-other",
+        text: "hello",
+        delivery: "auto",
+      }),
+    );
+
+    expect(mock.getTaskMeta).toHaveBeenCalledWith({ taskId: "task-other", workspacePath: WORKSPACE });
+    expect(mock.sendPrompt).not.toHaveBeenCalled();
+    expect(mock.enqueueTaskCommand).not.toHaveBeenCalled();
+    expect(mock.listActiveTaskIds).not.toHaveBeenCalled();
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 404, body: { error: "task_not_found" } });
+  });
+
+  it("stop/events：getTaskMeta null → 404 前置；meta 命中 → 正常走 stopGeneration 与 buffer", async () => {
+    const denied = createHarness({ getTaskMeta: vi.fn(async () => null) });
+    await denied.responder.handleRequest(
+      request("r1", { kind: "stop", workspacePath: WORKSPACE, taskId: TASK_ID }),
+    );
+    await denied.responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    expect(denied.mock.stopGeneration).not.toHaveBeenCalled();
+    expect(denied.mock.onDynamicTaskEvent).not.toHaveBeenCalled();
+    expect(denied.posted.at(-2)).toMatchObject({ status: 404, body: { error: "task_not_found" } });
+    expect(denied.posted.at(-1)).toMatchObject({ status: 404, body: { error: "task_not_found" } });
+
+    const allowed = createHarness();
+    await allowed.responder.handleRequest(
+      request("r1", { kind: "stop", workspacePath: WORKSPACE, taskId: TASK_ID }),
+    );
+    expect(allowed.mock.stopGeneration).toHaveBeenCalledWith({
+      taskId: TASK_ID,
+      workspacePath: WORKSPACE,
+    });
+    expect(allowed.posted.at(-1)).toMatchObject({ ok: true, status: 202, body: { ok: true } });
+
+    await allowed.responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    expect(allowed.mock.onDynamicTaskEvent).toHaveBeenCalledTimes(1);
+    expect(allowed.posted.at(-1)).toMatchObject({ status: 200, body: { events: [], nextSeq: 0 } });
   });
 
   it("服务缺失（getServices 返回 null）→ 503 unavailable_host", async () => {
