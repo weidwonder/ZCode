@@ -37,7 +37,7 @@ authority_refs:
 - `createLocalTaskApiResponder(deps: { getServices, post, now?, randomUUID? })` → `{ handleRequest(msg) }`。
 - 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|"enqueueTaskCommand"|"promoteTaskCommand"|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（签名变化编译红）。
 
-**要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询 + resync）；订阅生命周期（create/send 受理时建立，任务终态后 10 分钟释放订阅、事件截尾 50 条；其余随 Host 进程退出回收——responder 不单独接入 disposeHostResources 链，属有意取舍）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false（出站固定文案，原文进日志）。
+**要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询（唤醒按各 waiter 的 after 过滤）+ resync）；订阅生命周期（create/send 受理时建立，任务终态后 10 分钟整体释放订阅与缓冲（懒重建，after>0 回 resync）；其余随 Host 进程退出回收——responder 不单独接入 disposeHostResources 链，属有意取舍）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false（出站固定文案，原文进日志）。
 
 ### Task 1b（评审轮追加，haiku + 主会话）：taskId 重锚定与评审修复
 
@@ -82,7 +82,7 @@ authority_refs:
 |---|---|---|
 | haiku 类型漂移/编译错 | M | 任务书全文给类型；typecheck 先行；两次返工本会话接手 |
 | sendPrompt traceId 语义误用 | M | create 首条用 createResult.traceId（先例 host/index.ts:777）；续聊新 randomUUID |
-| 事件订阅泄漏 | M | 订阅表 + Host 关闭 dispose；终态不退订（保留 buffer）但事件流自然静默 |
+| 事件订阅泄漏 | M | 终态 10 分钟整体释放订阅与缓冲（懒重建）；其余随 Host 进程退出回收 |
 | taskRealtimeBus hosts 注册表访问方式不确定 | M | Task 2 前本会话先核实 bus 实例暴露形态（main/index.ts） |
 
 ## 替换清单核销

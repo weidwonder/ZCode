@@ -70,7 +70,7 @@ authority_refs:
 - **不做什么**：
   - 不做权限批复 API（`permission.requested` 事件只给摘要，去 GUI 处理）。
   - 不自动打开 workspace（409 而非 GUI 打开链——A2 调查证实该链条长且时机不确定）。
-  - 不管理「非本 API 创建的任务」：Main 归属表只在 create 时写入，ZCode 重启后旧 taskId 的 API 操作 404（桥接重新 create 即可；行为确定，见 §12 偏离）。
+  - 不主动管理非本 API 创建的任务：归属表由 create 与重锚定 2xx 回填写入；ZCode 重启后不带 workspacePath 的旧 taskId 404（带则按 FR-015 重锚定恢复接续）。
   - 不改 GUI、不改 bots、不改 Web 服务、不做远端 workspace（workspaceIdentity 非空 → 按 409 处理，本地 workspace 专用）。
   - 不做 TLS；不做 token 轮换；不做事件持久化（Host 内存 ring buffer）。
 - **既有系统清单**（穷举不判断；全部已在本分支卡片登记）：
@@ -107,7 +107,7 @@ authority_refs:
 | FR-013 | 日志：生命周期 info + 拒绝原因计数（401/403/415/413/409/503 各计数）；请求体/prompt/token 不落日志。 |
 | FR-014 | 上游文档 `docs/local-task-api.md`（英文）+ dw 产物同步（卡片、CHANGELOG、决策记录）。 |
 | FR-015 | 带 :taskId 的端点（messages/stop/get/events）接受可选 workspacePath（GET 用 query `?workspacePath=`，POST 放 body）：归属表命中照旧；未命中且带了 workspacePath → 按该工作区路由，Host 用 `getTaskMeta({taskId, workspacePath})`（`zcodeTaskService.ts:526-530`，null 即不属于/不存在 → 404）校验，应答 2xx 时 Main 回填归属表；未命中且未带 → 404。events 缓冲重启后为空是预期（空事件 + 当前 nextSeq，客户端用 GET task 取状态）。 |
-| FR-016 | create 可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口，命中未过期直接回 `201 {taskId}`（同 taskId，不再派发 Host）；并发数量 ZCode 侧不限流（调用方自限，见文档 Limitations）。 |
+| FR-016 | create 可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口——命中已完成的记 direct 返回同 `{taskId}`；**in-flight 期间并发同 id 请求 await 同一应答**（同 taskId 或同错误，不重复派发）；失败不缓存；并发数量 ZCode 侧不限流（调用方自限，见文档 Limitations）。 |
 
 ## 2. 数据模型 / 数据结构
 
@@ -250,12 +250,14 @@ authority_refs:
 | AC-003 | Host responder 单测（mock IZCodeTaskService，类型绑定 Pick 面）：create 参数形态（deferPersistenceUntilFirstPrompt、clientMode）、空闲 sent/运行 queued/steer（enqueue+promote 调用断言）、stop、五态投影、events 立即返回/长轮询唤醒/resync、input.queued 事件 | FR-005~FR-010, FR-012 |
 | AC-004 | Main 路由单测：归属表 miss→404、无 Host→409/503、dispatcher requestId 回流/超时 | FR-011 |
 | AC-005 | 上游文档 + dw 产物（卡片/CHANGELOG/决策记录/v1 spec 转 superseded） | FR-014 |
-| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规） | — |
+| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。第三轮修复后实测（2026-10-28 第三轮）：typecheck 0 错；Main 30 + Host 28 共 58 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规） | — |
 | AC-007 | 日志断言：拒绝路径计数、无 prompt 内容 | FR-013 |
 | AC-008 | 重锚定测试：重启（表空）后带 workspacePath 续聊成功且回填（后续请求可省略）；带错 workspacePath 404 透传且不回填；不带 404；Host 侧 send/stop/events 对不属于该 workspace 的任务 404 且不触发写操作 | FR-015 |
 | AC-009 | 评审轮补充测试：create 部分失败（sendPrompt reject）仍 201 带 warning 且 taskId 可用；订阅建立失败不影响 201；send 受理后 buffer 即有 input.queued；waiting_input 五态分支；mode 非法 400；clientRequestId 命中返回同 taskId 不再派发；Host 退出结清在飞请求；终态后流订阅释放；op 异常出站固定文案 + 日志留痕 | FR-005/FR-013/FR-016 及评审项 |
+| AC-010 | 第三轮补充测试：长轮询唤醒只含 after 之后的新事件；懒重建后 after>0 回 `{resync:true}`、after=0 得空事件；steer promote 失败回 `202 queued+promote_failed` 且发 `input.queued`；rename 失败 201 带 `rename_failed`（与 first_prompt_failed 优先级）；clientRequestId 并发同 id 只派发一次且两请求同 taskId、失败不缓存 | r3-37 #3、r3-39 #1/#2/#3/#4 |
 
-**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003/AC-009；FR-006→AC-003；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007/AC-009；FR-014→AC-005；FR-015→AC-008；FR-016→AC-009。
+**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003/AC-009；FR-006→AC-003/AC-010；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003/AC-010；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007/AC-009；FR-014→AC-005；FR-015→AC-008；FR-016→AC-009/AC-010。
+
 
 
 ## 12. 契约偏离（对上级契约 v2 文本；最终总结会重复列出）
@@ -270,12 +272,14 @@ authority_refs:
 | 6 | workspaceIdentity 非空（远端 workspace）→ 409 | v2 只做本地 workspace；路由表 workspaceKeys 只含本地 |
 | 7 | 检查顺序：Host 头(403) → Bearer(401) → Content-Type(415) → 大小(413)；路径级 404/405 在鉴权前返回；POST body 参数校验（400 bad_request）先于 taskId 归属判定（404） | DNS rebinding 防护先于鉴权；契约未定顺序 |
 | 8 | `input.queued`/`input.steered` 事件由 API 自身在受理成功时产生（非流事件投影；enqueue 成功即建订阅，受理即有事件） | CLI 流不区分 API 投递来源；受理即事实 |
-| 9 | 事件字段形状：`turn.started{turnId}`、`assistant.message{text}`、`turn.completed{text}`、`turn.failed{error}`、`permission.requested{summary}`、`input.queued|steered{commandId}`；seq 每 task 从 1 单调；缓冲每任务 500 条、溢出 `{resync:true}`；`task_error` 流事件与 failed 终态 1s 内去重只发一次；任务终态后 10 分钟整体释放订阅与缓冲（懒重建） | 契约正文未逐一点名字段名；去重防重复 failed；修剪防长驻进程累积 |
+| 9 | 事件字段形状：`turn.started{turnId}`、`assistant.message{text}`、`turn.completed{text}`、`turn.failed{error}`、`permission.requested{summary}`、`input.queued|steered{commandId}`；seq 每 task 从 1 单调（终态释放后懒重建从 1 重计，`after>0` 的旧水位返回 `{resync:true}`）；缓冲每任务 500 条、溢出 `{resync:true}`；长轮询唤醒按各客户端 `after` 过滤只发新事件；`task_error` 流事件与 failed 终态 1s 内去重只发一次；任务终态后 10 分钟整体释放订阅与缓冲（懒重建） | 契约正文未逐一点名字段名；去重防重复 failed；修剪防长驻进程累积 |
 | 10 | POST `/stop` 空 body 放行（无 Content-Type 也可）；`?workspacePath=`/body 空字符串视为未提供 | 传输层宽容语义已在文档写明 |
 | 11 | create 的 `mode` 经双层枚举白名单（对齐 `ZCodeTaskMode` 全集），非法值 400；上游文档列取值与权限含义（bypass 类档位会跳过权限闸门，含明确警示） | 评审拍板①；防 shared schema 拒绝导致的 300s 悬挂与免审批档位静默可达 |
 | 12 | create 接受可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口，命中直接返回同一 `{taskId}` 不再派发 | 评审拍板②；create 有真实 agent 运行成本，HTTP 超时盲重试不应重复建任务 |
-| 13 | create 部分失败（首条 prompt 发送失败）仍回 `201 {taskId, warning:"first_prompt_failed"}`；订阅建立失败不影响 201 | 评审 r2-29 #1：副作用可见可接续，避免孤儿任务与重试重复建任务 |
+| 13 | create 部分失败仍回 `201 {taskId, warning}`：`first_prompt_failed`（首条 prompt 发送失败）优先于 `rename_failed`（title 改名失败）；订阅建立失败不影响 201 | 评审 r2-29 #1 / r3-39 #4：副作用可见可接续；title 是对账锚点，丢失需可辨 |
 | 14 | Host 退出时 Main 立即结清该 Host 的在飞请求（503），不等 300s 兜底；并发数量 ZCode 侧不限流（文档写明由调用方自限）；开关文件 group/other 可读仅 warn 不拒启 | 评审拍板③④与 r2-29 #3 |
+| 15 | steer 的 promote 失败 → `202 {delivery:"queued", commandId, warning:"promote_failed"}` 并照发 `input.queued` 事件 | 评审 r3-39 #1：enqueue 已成功、命令会被执行，与 create 部分失败同型——副作用可见，防重试重复入队 |
+| 16 | clientRequestId 并发同 id：in-flight 期间后续请求 await 同一应答（同 taskId 或同错误），不重复派发；失败不缓存（后续请求可重试） | 评审 r3-39 #3：HTTP 超时早于 create 应答时重试落进 in-flight 窗口，占位共享才能保证幂等 |
 
 ## 13. 过稿记录（MUST）
 
