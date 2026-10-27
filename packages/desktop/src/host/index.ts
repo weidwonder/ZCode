@@ -86,6 +86,7 @@ import {
   type OffPeakRequestAuthBuilder,
 } from "@zcode/services/node";
 import { createHostResourceUsageResponder } from "./hostResourceUsage.js";
+import { createLocalTaskApiResponder } from "./localTaskApiResponder.js";
 import {
   assertBoundSessionDispatchable,
   resolveOffPeakDispatchKind,
@@ -1854,6 +1855,11 @@ const hostResourceUsageResponder = createHostResourceUsageResponder({
   getAgentService: () => activeServices?.getOptional(IZCodeAgentService),
   postMessage: (message) => parentPort?.postMessage(message),
 });
+// 本机任务 API：Main 按 workspace 路由到本 Host，这里只定位任务服务并回传结果。
+const localTaskApiResponder = createLocalTaskApiResponder({
+  getServices: () => activeServices,
+  post: (message) => parentPort?.postMessage(message),
+});
 let activeSessionRealtimePort: ReturnType<typeof createTaskRealtimeBridgeForHostInit> = null;
 let hasDisposedHostResources = false;
 let disposeHostResourcesInFlight: Promise<HostShutdownResult> | null = null;
@@ -2960,6 +2966,10 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
   }
   if (msg.type === HostMessageTypes.NetworkCapture) {
     hostNetworkCapture.setCaptureId(msg.control.captureId);
+    return;
+  }
+  if (msg.type === HostMessageTypes.LocalTaskApiRequest) {
+    void localTaskApiResponder.handleRequest(msg);
     return;
   }
   const port = e.ports[0];

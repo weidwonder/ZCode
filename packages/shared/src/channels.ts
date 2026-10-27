@@ -661,6 +661,8 @@ export const HostMessageTypes = {
   NetworkCapture: "network-capture",
   /** main → host：Main 的实时界面语言变化（Host 用于 ZCode endpoint 的 X-Client-Language） */
   ApplicationLocaleChanged: "application-locale-changed",
+  /** main → host：本机任务 API 请求转发（create/send/stop/get/events/list），按 requestId 应答 */
+  LocalTaskApiRequest: "local-task-api-request",
 } as const;
 
 /** host process → main process 的反馈消息类型 */
@@ -763,6 +765,8 @@ export const HostResponseTypes = {
   ProviderProvisioningSourceChanged: "provider-provisioning-source-changed",
   /** host → main：一次 Remote Environment 同步执行完毕。 */
   ProviderProvisioningExecutionResult: "provider-provisioning-execution-result",
+  /** host → main：本机任务 API 处理结果（status/body 透传，按 requestId 关联） */
+  LocalTaskApiResponse: "local-task-api-response",
 } as const;
 
 // ============================================================================

@@ -959,6 +959,82 @@ export type HostResourceUsageSnapshotRequestMessage = z.infer<
   typeof hostResourceUsageSnapshotRequestMessageSchema
 >;
 
+/** 本机任务 API 的 op 参数（main 已解析 workspacePath，Host 不重复做路由）。 */
+export const localTaskApiRequestOpSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("create"),
+      workspacePath: nonEmptyStringSchema,
+      prompt: z.string(),
+      mode: nonEmptyStringSchema.optional(),
+      title: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("send"),
+      workspacePath: nonEmptyStringSchema,
+      taskId: nonEmptyStringSchema,
+      text: z.string(),
+      delivery: z.enum(["auto", "queue", "steer"]),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("stop"),
+      workspacePath: nonEmptyStringSchema,
+      taskId: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("get"),
+      workspacePath: nonEmptyStringSchema,
+      taskId: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("events"),
+      workspacePath: nonEmptyStringSchema,
+      taskId: nonEmptyStringSchema,
+      after: z.number().int().nonnegative(),
+      waitMs: z.number().int().min(0).max(30_000),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("list"),
+      workspacePath: nonEmptyStringSchema,
+    })
+    .strict(),
+]);
+export type LocalTaskApiRequestOp = z.infer<typeof localTaskApiRequestOpSchema>;
+
+export const hostLocalTaskApiRequestMessageSchema = z
+  .object({
+    type: z.literal("local-task-api-request"),
+    requestId: nonEmptyStringSchema,
+    op: localTaskApiRequestOpSchema,
+  })
+  .strict();
+export type HostLocalTaskApiRequestMessage = z.infer<
+  typeof hostLocalTaskApiRequestMessageSchema
+>;
+
+export const hostLocalTaskApiResponseMessageSchema = z
+  .object({
+    type: z.literal("local-task-api-response"),
+    requestId: nonEmptyStringSchema,
+    ok: z.boolean(),
+    status: z.number().int().min(200).max(599),
+    body: z.unknown(),
+  })
+  .strict();
+export type HostLocalTaskApiResponseMessage = z.infer<
+  typeof hostLocalTaskApiResponseMessageSchema
+>;
+
 export const hostIncomingMessageSchema = z.discriminatedUnion("type", [
   hostPrepareProjectWorkspaceMessageSchema,
   z.object({ type: z.literal("network-capture"), control: networkCaptureControlSchema }).strict(),
@@ -995,6 +1071,7 @@ export const hostIncomingMessageSchema = z.discriminatedUnion("type", [
   hostCuaPipFocusChangedMessageSchema,
   hostApplicationLocaleChangedMessageSchema,
   hostProviderProvisioningExecuteMessageSchema,
+  hostLocalTaskApiRequestMessageSchema,
 ]);
 
 export const hostRemoteWorkspaceConnectedResponseSchema = z
@@ -1614,6 +1691,7 @@ export const hostResponseMessageSchema = z.discriminatedUnion("type", [
   hostOffPeakRunResultResponseSchema,
   hostCronSchedulerWakeRequestResponseSchema,
   hostOffPeakSchedulerWakeRequestResponseSchema,
+  hostLocalTaskApiResponseMessageSchema,
 ]);
 
 export const zcodeTaskPersistStatusSchema = z.enum(["running", "completed", "error"]);
