@@ -86,6 +86,7 @@ import {
   type OffPeakRequestAuthBuilder,
 } from "@zcode/services/node";
 import { createHostResourceUsageResponder } from "./hostResourceUsage.js";
+import { createBotWebhookIngressResponder } from "./botWebhookIngressResponder.js";
 import {
   assertBoundSessionDispatchable,
   resolveOffPeakDispatchKind,
@@ -1854,6 +1855,11 @@ const hostResourceUsageResponder = createHostResourceUsageResponder({
   getAgentService: () => activeServices?.getOptional(IZCodeAgentService),
   postMessage: (message) => parentPort?.postMessage(message),
 });
+// 本机 Webhook Bot 入站回调：Main 转发到任一存活窗口 Host，这里只定位 bots 服务并回传结果。
+const botWebhookIngressResponder = createBotWebhookIngressResponder({
+  getServices: () => activeServices,
+  post: (message) => parentPort?.postMessage(message),
+});
 let activeSessionRealtimePort: ReturnType<typeof createTaskRealtimeBridgeForHostInit> = null;
 let hasDisposedHostResources = false;
 let disposeHostResourcesInFlight: Promise<HostShutdownResult> | null = null;
@@ -2956,6 +2962,10 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
   }
   if (msg.type === HostMessageTypes.ApplicationLocaleChanged) {
     applicationLocale = msg.locale;
+    return;
+  }
+  if (msg.type === HostMessageTypes.BotWebhookIngressDispatch) {
+    void botWebhookIngressResponder.handleDispatch(msg);
     return;
   }
   if (msg.type === HostMessageTypes.NetworkCapture) {
