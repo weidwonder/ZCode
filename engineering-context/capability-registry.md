@@ -13,7 +13,9 @@
 
 | Capability | 权威实现 | 陷阱项（废弃或中间产物） |
 |---|---|---|
-| 【能力，如 背单词记录】 | 【现在该改/该调的那一个，如 POST /v2/word/record 或 src/word/record.ts】 | 【相似但不该用的旧实现，如 POST /v1/word/record；确实没有就写 无】 |
+| webhook bot 入站回调处理（解析/鉴权/状态映射） | packages/services/src/bots/webhookCallbackHttp.ts#handleWebhookBotCallback（域卡 bots-webhook-callback） | webhook secret 不走 saveBot 的 credentialValue（存错 ref），必须用 webhookSecretValue |
+| Main→Host 请求转发（requestId 模式） | packages/desktop/src/main/resourceManagerHostSampling.ts#requestHostResourceUsage（先例，域卡 desktop-host-ipc） | Main 进程内没有 IBotsService 实例，禁止 Main 直接 get；不要为此新建 RPC ChannelClient |
+| Bots 设置 provider 列表与凭据保存 | packages/ui/src/BotsDialog.tsx#saveBot（域卡 bots-ui） | per-provider i18n key 必须 zh-CN/en-US 成对，缺一个渲染 fallback |
 
 ## 能力表（完整形态）
 
