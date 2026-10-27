@@ -37,7 +37,15 @@ authority_refs:
 - `createLocalTaskApiResponder(deps: { getServices, post, now?, randomUUID? })` → `{ handleRequest(msg) }`。
 - 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|"enqueueTaskCommand"|"promoteTaskCommand"|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（签名变化编译红）。
 
-**要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询 + resync）；订阅生命周期（create 时建立，task 终态后保留 buffer 供读，Host 关闭统一 dispose）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false。
+**要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询 + resync）；订阅生命周期（create/send 受理时建立，任务终态后 10 分钟释放订阅、事件截尾 50 条；其余随 Host 进程退出回收——responder 不单独接入 disposeHostResources 链，属有意取舍）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false（出站固定文案，原文进日志）。
+
+### Task 1b（评审轮追加，haiku + 主会话）：taskId 重锚定与评审修复
+
+**满足:** FR-015、FR-016 及评审 r2-27/28/29 各项 ｜ **依赖:** Task 1/2
+
+- Main：`:taskId` 端点可选 workspacePath 重锚定（bc566a4c）；clientRequestId 10 分钟去重；mode 枚举白名单；开关文件权限 warn；Host 退出结清在飞请求；拒绝日志与计数输出口；create 登记条件放宽到 2xx 带 taskId。
+- Host：send/stop/events 前置 getTaskMeta 归属校验；create 部分失败 201+warning；summary 用真实字段；get 单读快照；终态修剪；op 异常固定文案。
+- 测试：Main 21→28、Host 18→24（详见 spec AC-008/009；52/52 实测全绿）。
 
 **验证:** `pnpm vitest run packages/desktop/test/localTaskApiResponder.test.ts` + `pnpm typecheck`。
 

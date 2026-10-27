@@ -9,8 +9,8 @@
 |---|---|---|---|---|---|
 | 任务服务业务面（createTask/sendPrompt/enqueue+promote/stop/snapshot/active/事件订阅） | `packages/services/src/session/zcodeTaskService.ts#IZCodeTaskService` | 内部 | canonical | Host responder（Pick 12 方法） | createTask+sendPrompt 参数形态照抄 host/index.ts 无界面派发先例；running 判定只能用 listActiveTaskIds |
 | 无界面派发先例（createTask→sendPrompt） | `packages/desktop/src/host/index.ts#dispatchOffPeakRun` | 内部 | canonical | 闲时任务 | deferPersistenceUntilFirstPrompt:true；clientMode "desktop-continuous"；续聊 traceId 用新 uuid |
-| pendingInteraction（waiting 判定） | `packages/shared/src/zcode-task-types-core.ts#ZCodeTaskMeta`（pendingInteraction 字段） | 内部 | canonical | get 五态 | kind permission/userInput |
-| 流事件类型判别（turn/权限/完成/失败） | `packages/shared/src/zcode-task-types-core.ts#ZCodeStreamEvent` | 内部 | canonical | 事件投影 | task_run_started/task_complete/task_error/permission_request 是粗粒度投影源 |
+| waiting 判定（runtime 快照字段） | `packages/shared/src/zcode-task-types-core.ts`（ZCodeSessionRuntimeSnapshot 的 pendingPermissions/pendingElicitations；meta.pendingInteraction 是 sessions-index 摘要、非本 API 判定源） | 内部 | canonical | get 五态 | 判定序：pending 两类 → running（listActiveTaskIds）→ error（meta.status）→ idle |
+| 流事件类型判别（turn/权限/完成/失败） | `packages/shared/src/zcode-task-types-core.ts#ZCodeStreamEvent` | 内部 | canonical | 事件投影 | task_run_started/task_complete/task_error/permission_request 是粗粒度投影源；终态后 10 分钟整体释放订阅与缓冲（懒重建） |
 | workspace→Host 路由数据源 | `packages/desktop/src/main/taskRealtimeBus.ts#TaskRealtimeBus`（hosts 注册表） | 内部 | canonical | Main 路由函数 | workspaceKey = workspaceIdentity?.trim() \|\| workspacePath；renderer 经 SyncWindowTabs 上报（desktopMainIpcPlatform.ts） |
 | Main 监听与鉴权 | `packages/desktop/src/main/localTaskApi.ts#createLocalTaskApi` | HTTP(loopback) | v2 | 桥接程序 | 开关文件 local-task-api.json（enabled/port/token≥32）；Host 头→Bearer(sha256+timingSafeEqual)→Content-Type→16MiB |
 | taskId 重锚定（重启后接续） | Main 侧 `resolveTaskWorkspace`（同上文件）；Host 校验用 `packages/services/src/session/zcodeTaskService.ts#IZCodeTaskService` 的 getTaskMeta | 内部 | v2 | 桥接程序 | 归属表未命中 + 请求带 workspacePath → Host getTaskMeta 核实（null→404）→ 2xx 回填归属表；未命中未带 → 404 |

@@ -1,13 +1,15 @@
 ---
-lifecycle: active
-superseded_by: ''
-archived: ''
-last_confirmed: '2026-10-27'
+lifecycle: superseded
+superseded_by: '2026-10-28-local-task-api-coding-plan.md'
+archived: '2026-10-28'
+last_confirmed: '2026-10-28'
 authority_refs:
   - 'handleWebhookBotCallback(params) 签名与返回形状（services 公共函数）'
   - 'HostMessageTypes.BotWebhookIngressDispatch / HostResponseTypes.BotWebhookIngressResult 的 payload 契约'
   - 'createBotWebhookIngress(deps) 的注入形状'
 ---
+
+> **已归档（2026-10-28）｜lifecycle: superseded**：本文对应的 v1 方案（Webhook Bot 入站）已整体回退，由 docs/plan/2026-10-28-local-task-api-coding-plan.md（本机任务 API）取代；上述 authority_refs 指向的实体已不存在。与现行文档冲突时以现行为准，MUST NOT 据本文实施。
 
 # 桌面版本机 Webhook Bot 入站端点 Coding Plan
 

@@ -33,4 +33,4 @@ authority_refs:
 
 - v1 全部功能改动随 75f60bd3 回退到 origin/main 原样（services 抽取、server 路由、UI、消息对、应答器、文档）。
 - v1 调查结论中仍有效的架构事实（bots 服务在每窗口 Host、Main 无实例、requestId postMessage 模式、taskRealtimeBus 路由）保留在 engineering-context 卡片。
-- v1 eng-spec 转 superseded；实现与验证按 `docs/spec/2026-10-28-zcode-local-task-api-eng-spec.md`。
+- v1 eng-spec 与配套 coding plan 均转 superseded（后者 superseded_by 指向 2026-10-28 的 plan）；实现与验证按 `docs/spec/2026-10-28-zcode-local-task-api-eng-spec.md`。

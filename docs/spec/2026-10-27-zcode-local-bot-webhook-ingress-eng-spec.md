@@ -10,6 +10,8 @@ authority_refs:
   - 'main↔host 新消息对 BotWebhookIngressDispatch / BotWebhookIngressResult 的 payload 契约'
 ---
 
+> **已归档（2026-10-28）｜lifecycle: superseded**：本文已被 docs/spec/2026-10-28-zcode-local-task-api-eng-spec.md 取代（v1 方案随 75f60bd3 整体回退）。与现行文档冲突时以现行为准，MUST NOT 据本文实施。
+
 # ZCode_技术 Spec — 桌面版本机 Webhook Bot 入站端点
 
 > 单仓库详细技术规范。遵循 `spec写作纪律.md`：零上下文可动手、RFC2119、无占位符。
