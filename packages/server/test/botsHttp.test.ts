@@ -137,4 +137,35 @@ describe("bots HTTP callback", () => {
       error: "Provider feishu does not support HTTP callbacks.",
     });
   });
+
+  it("passes the path botId to the bots service callback payload", async () => {
+    const handleProviderCallbackResponse = vi.fn(async () => ({
+      ok: true,
+      replies: [],
+    }));
+    const services = new ServiceCollection().register(IBotsService, {
+      handleProviderCallbackResponse,
+    } as unknown as BotsService);
+    const server = createHttpServer(services, 0);
+    servers.push(server);
+    const address = server.address() as AddressInfo;
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/bots/webhook/webhook-1`,
+      {
+        method: "POST",
+        headers: { "x-zcode-bot-secret": "path-secret" },
+        body: JSON.stringify({ userId: "user-1", text: "/status" }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(handleProviderCallbackResponse).toHaveBeenCalledWith("webhook", {
+      userId: "user-1",
+      text: "/status",
+      rawBody: JSON.stringify({ userId: "user-1", text: "/status" }),
+      botId: "webhook-1",
+      webhookSecret: "path-secret",
+    });
+  });
 });
