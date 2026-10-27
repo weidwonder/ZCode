@@ -12,6 +12,7 @@ interface Harness {
   eventListeners: Array<(event: unknown) => void>;
   terminalListeners: Array<(outcome: unknown) => void>;
   mock: Record<string, ReturnType<typeof vi.fn>>;
+  log: ReturnType<typeof vi.fn>;
 }
 
 /** ServiceCollection + 12 个 Pick 面方法全量 mock；post 收集到数组。 */
@@ -56,11 +57,15 @@ function createHarness(overrides: Record<string, unknown> = {}): Harness {
   const services = new ServiceCollection();
   services.register(IZCodeTaskService, mock as unknown as IZCodeTaskService);
   const posted: HostLocalTaskApiResponseMessage[] = [];
+  const log = vi.fn();
   const responder = createLocalTaskApiResponder({
     getServices: () => services,
     post: (message) => posted.push(message),
+    log,
+    // 终态修剪走真实 timer；小值让修剪用例 20ms 内完成。
+    terminalPruneDelayMs: 10,
   });
-  return { responder, posted, eventListeners, terminalListeners, mock };
+  return { responder, posted, eventListeners, terminalListeners, mock, log };
 }
 
 function request(requestId: string, op: HostLocalTaskApiRequestMessage["op"]): HostLocalTaskApiRequestMessage {
@@ -427,8 +432,8 @@ describe("localTaskApiResponder", () => {
     expect(posted.at(-1)).toMatchObject({ status: 503, body: { error: "unavailable_host" } });
   });
 
-  it("op 抛错（createTask reject）→ ok=false + 503", async () => {
-    const { responder, posted, mock } = createHarness();
+  it("op 抛错（createTask reject）→ ok=false + 503 固定文案，原始错误只进 log", async () => {
+    const { responder, posted, mock, log } = createHarness();
     mock.createTask.mockImplementation(async () => {
       throw new Error("boom");
     });
@@ -437,8 +442,13 @@ describe("localTaskApiResponder", () => {
       request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
     );
 
-    expect(posted.at(-1)).toMatchObject({ ok: false, status: 503 });
-    expect((posted.at(-1)!.body as { error: string }).error).toContain("boom");
+    expect(posted.at(-1)).toMatchObject({
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect(JSON.stringify(posted.at(-1)!.body)).not.toContain("boom");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("boom"));
   });
 
   it("list：tasks 投影按 active 集合标 running/idle", async () => {
@@ -456,5 +466,123 @@ describe("localTaskApiResponder", () => {
     const tasks = (posted.at(-1)!.body as { tasks: Array<Record<string, unknown>> }).tasks;
     expect(tasks[0]).toMatchObject({ taskId: "a", title: "A", status: "running", updatedAt: 1 });
     expect(tasks[1]).toMatchObject({ taskId: "b", title: "B", status: "idle", updatedAt: 2 });
+  });
+
+  it("get：pendingElicitations → waiting_input", async () => {
+    const { responder, posted, mock } = createHarness();
+    mock.getTaskSnapshot.mockImplementation(async () =>
+      snapshotMock({ runtime: { pendingElicitations: [{}] } }),
+    );
+
+    await responder.handleRequest(
+      request("r1", { kind: "get", workspacePath: WORKSPACE, taskId: TASK_ID }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({ status: 200, body: { status: "waiting_input" } });
+  });
+
+  it("send 运行中 auto：受理即补订阅，随后 events 立即可查 input.queued", async () => {
+    const { responder, posted, mock } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "auto",
+      }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 202, body: { delivery: "queued" } });
+
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string }> }).events;
+    expect(events.some((event) => event.type === "input.queued")).toBe(true);
+  });
+
+  it("create：首条 prompt 失败 → 仍 201 + warning=first_prompt_failed，taskId 与 createTask 返回一致", async () => {
+    const { responder, posted, mock, log } = createHarness();
+    mock.sendPrompt.mockImplementation(async () => {
+      throw new Error("prompt rejected");
+    });
+
+    await responder.handleRequest(
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 201,
+      body: { taskId: TASK_ID, warning: "first_prompt_failed" },
+    });
+    expect((posted.at(-1)!.body as { taskId: string }).taskId).toBe(TASK_ID);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("prompt rejected"));
+  });
+
+  it("create：订阅建立失败不回滚 → 仍 201 且 taskId 在、sendPrompt 照发", async () => {
+    const { responder, posted, mock } = createHarness({
+      onDynamicTaskEvent: vi.fn(() => {
+        throw new Error("subscription failed");
+      }),
+    });
+
+    await responder.handleRequest(
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201 });
+    expect((posted.at(-1)!.body as { taskId?: string }).taskId).toBe(TASK_ID);
+    expect(mock.sendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("op 抛错（stopGeneration reject）→ 出站固定文案 unavailable_host，不含原始错误文本", async () => {
+    const { responder, posted, mock, log } = createHarness();
+    mock.stopGeneration.mockImplementation(async () => {
+      throw new Error("stop exploded");
+    });
+
+    await responder.handleRequest(
+      request("r1", { kind: "stop", workspacePath: WORKSPACE, taskId: TASK_ID }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect(JSON.stringify(posted.at(-1)!.body)).not.toContain("stop exploded");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("stop exploded"));
+  });
+
+  it("终态修剪：succeeded 终态后延迟释放 buffer，流事件不再入 buffer、events 查询懒建新 buffer", async () => {
+    const { responder, posted, eventListeners, terminalListeners, mock } = createHarness();
+
+    await responder.handleRequest(
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
+    );
+    expect(mock.onDynamicTaskEvent).toHaveBeenCalledTimes(1);
+    const streamListener = eventListeners[0]!;
+    const terminalListener = terminalListeners[0]!;
+
+    // 三种 outcome 都算终态：succeeded 也会排修剪 timer（terminalPruneDelayMs=10）。
+    terminalListener({ outcome: "succeeded" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // 修剪后 buffer 已移除：流事件（含 disposed 订阅迟到的投递）不再累积。
+    streamListener({ type: "task_run_started", turnId: "after-prune" });
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 200,
+      body: { events: [], nextSeq: 0 },
+    });
+    // events 查询懒建了新 buffer（第 2 次订阅），证明旧 buffer 已被修剪释放。
+    expect(mock.onDynamicTaskEvent).toHaveBeenCalledTimes(2);
   });
 });

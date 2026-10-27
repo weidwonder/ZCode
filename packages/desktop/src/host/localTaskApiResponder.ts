@@ -62,6 +62,10 @@ export interface LocalTaskApiResponder {
 export function createLocalTaskApiResponder(deps: {
   getServices: () => ServiceCollection | null;
   post: (message: HostLocalTaskApiResponseMessage) => void;
+  /** 诊断日志出口（Host 侧 logger）；出站 body 只带固定文案，原始错误只进这里。 */
+  log?: (message: string) => void;
+  /** 终态后延迟修剪的等待时长；默认 10 分钟。测试注入小值即可验证。 */
+  terminalPruneDelayMs?: number;
   now?: () => number; // 测试注入，默认 Date.now
   randomUUID?: () => string; // 测试注入，默认 node:crypto 的 randomUUID
 }): LocalTaskApiResponder {
@@ -103,12 +107,10 @@ export function createLocalTaskApiResponder(deps: {
     appendEvent(taskId, { type: "turn.failed", error });
   }
 
-  async function readLastAssistantText(
-    taskService: LocalTaskApiTaskService,
-    workspacePath: string,
-    taskId: string,
-  ): Promise<string> {
-    const snapshot = await taskService.getTaskSnapshot({ taskId, workspacePath });
+  /** 纯函数：快照里反向找最后一条 assistant 文本；null 快照或无 assistant 消息返回 ""。 */
+  function lastAssistantTextFromSnapshot(
+    snapshot: Awaited<ReturnType<LocalTaskApiTaskService["getTaskSnapshot"]>>,
+  ): string {
     if (!snapshot) return "";
     for (let i = snapshot.messages.length - 1; i >= 0; i -= 1) {
       const message = snapshot.messages[i]!;
@@ -117,7 +119,7 @@ export function createLocalTaskApiResponder(deps: {
     return "";
   }
 
-  /** 已存在直接返回；否则建 buffer 并挂两个订阅。订阅建立失败向上抛（create op 会 catch 清理）。 */
+  /** 已存在直接返回；否则建 buffer 并挂两个订阅。失败向上抛：create 只记 log 不回滚，events/懒订阅路径交给外层 503。 */
   function ensureSubscriptions(
     taskService: LocalTaskApiTaskService,
     workspacePath: string,
@@ -133,20 +135,21 @@ export function createLocalTaskApiResponder(deps: {
           if (event.type === "task_run_started") {
             appendEvent(taskId, {
               type: "turn.started",
-              turnId: (event as { turnId?: string }).turnId ?? "",
+              turnId: event.turnId ?? "",
             });
           } else if (event.type === "permission_request") {
-            const kind = (event as { kind?: string }).kind ?? "permission";
-            const toolName = (event as { toolName?: string }).toolName;
+            // summary 用事件真实字段：kind + title（缺省回落 description）；恒 undefined 的 toolName 已删。
             appendEvent(taskId, {
               type: "permission.requested",
-              summary: `${kind}${toolName ? " " + toolName : ""}`,
+              summary: `${event.kind} ${event.title ?? event.description}`.trim(),
             });
           } else if (event.type === "task_complete") {
-            // 快照读失败（异常/null）时 text 用 ""，仍发两条。
-            void readLastAssistantText(taskService, workspacePath, taskId)
-              .catch(() => "")
-              .then((text) => {
+            // 快照读失败（异常/null）时 text 用 ""，仍发两条；事件路径单次读快照。
+            void taskService
+              .getTaskSnapshot({ taskId, workspacePath })
+              .catch(() => null)
+              .then((snapshot) => {
+                const text = lastAssistantTextFromSnapshot(snapshot);
                 appendEvent(taskId, { type: "assistant.message", text });
                 appendEvent(taskId, { type: "turn.completed", text });
               });
@@ -162,6 +165,21 @@ export function createLocalTaskApiResponder(deps: {
             appendEvent(taskId, { type: "turn.completed", text: "" });
           }
           // succeeded：task_complete 流事件已覆盖，不重复发
+          // 终态后延迟修剪：释放流订阅并整体移除 buffer，避免长驻进程累积每任务缓冲。
+          // 修剪后再到的流事件按"无 buffer"忽略；客户端再查 events 会懒建新 buffer。
+          // 同一 buffer 多次终态会排多个 timer——幂等，无害。
+          setTimeout(() => {
+            for (const subscription of buffer.subscriptions) {
+              try {
+                subscription.dispose();
+              } catch {
+                // 已释放
+              }
+            }
+            buffer.subscriptions.length = 0;
+            buffer.events.length = 0;
+            buffers.delete(taskId);
+          }, deps.terminalPruneDelayMs ?? 600_000).unref?.();
         }),
       );
     } catch (error) {
@@ -184,12 +202,9 @@ export function createLocalTaskApiResponder(deps: {
     snapshot: Awaited<ReturnType<LocalTaskApiTaskService["getTaskSnapshot"]>>,
   ): Promise<string> {
     if (!snapshot) return "idle";
-    // runtime 字段类型上可能没有 pendingPermissions / pendingElicitations，按形状读取。
-    const runtime = snapshot.runtime as
-      | { pendingPermissions?: unknown[]; pendingElicitations?: unknown[] }
-      | undefined;
-    if (runtime?.pendingPermissions?.length) return "waiting_permission";
-    if (runtime?.pendingElicitations?.length) return "waiting_input";
+    // ZCodeTaskSnapshot["runtime"] 类型自带 pendingPermissions / pendingElicitations，直接访问。
+    if (snapshot.runtime?.pendingPermissions?.length) return "waiting_permission";
+    if (snapshot.runtime?.pendingElicitations?.length) return "waiting_input";
     if ((await taskService.listActiveTaskIds({ workspacePath: op.workspacePath })).includes(op.taskId)) {
       return "running";
     }
@@ -205,7 +220,7 @@ export function createLocalTaskApiResponder(deps: {
       const created = await taskService.createTask({
         workspacePath: op.workspacePath,
         deferPersistenceUntilFirstPrompt: true,
-        ...(op.mode ? { mode: op.mode as never } : {}),
+        ...(op.mode ? { mode: op.mode } : {}),
       });
       if (op.title) {
         try {
@@ -218,18 +233,32 @@ export function createLocalTaskApiResponder(deps: {
           // 改名失败不致命：继续发送首条 prompt
         }
       }
+      // 任务已建成：订阅失败不回滚 create、也不让整体 503；后续首次 events 调用会懒订阅兜底。
       try {
         ensureSubscriptions(taskService, op.workspacePath, created.taskId);
       } catch (error) {
-        buffers.delete(created.taskId);
-        throw error;
+        deps.log?.(
+          `local task api: subscription setup failed after create (taskId=${created.taskId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
-      await taskService.sendPrompt({
-        taskId: created.taskId,
-        traceId: created.traceId,
-        content: op.prompt,
-        clientMode: "desktop-continuous",
-      });
+      // 首条 prompt 失败也不吞 taskId：任务已建（副作用可见、可接续），warning 告知调用方。
+      try {
+        await taskService.sendPrompt({
+          taskId: created.taskId,
+          traceId: created.traceId,
+          content: op.prompt,
+          clientMode: "desktop-continuous",
+        });
+      } catch (error) {
+        deps.log?.(
+          `local task api: first prompt failed (taskId=${created.taskId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return { status: 201, body: { taskId: created.taskId, warning: "first_prompt_failed" } };
+      }
       return { status: 201, body: { taskId: created.taskId } };
     }
 
@@ -258,6 +287,13 @@ export function createLocalTaskApiResponder(deps: {
         type: "send_prompt",
         content: op.text,
       });
+      // 受理即补订阅：保证入队事件（input.queued / input.steered）能进 buffer；
+      // 失败不致命（首次 events 调用懒订阅兜底），只是这批事件可能不被记录。
+      try {
+        ensureSubscriptions(taskService, op.workspacePath, op.taskId);
+      } catch {
+        // 懒订阅兜底由首次 events 调用承担
+      }
       if (op.delivery === "steer") {
         await taskService.promoteTaskCommand({
           workspacePath: op.workspacePath,
@@ -290,7 +326,7 @@ export function createLocalTaskApiResponder(deps: {
       });
       if (!snapshot) return { status: 404, body: { error: "task_not_found" } };
       const status = await readSnapshotStatus(taskService, op, snapshot);
-      const lastAssistantText = await readLastAssistantText(taskService, op.workspacePath, op.taskId);
+      const lastAssistantText = lastAssistantTextFromSnapshot(snapshot);
       const turnCount = snapshot.messages.filter((message) => message.role === "assistant").length;
       return {
         status: 200,
@@ -360,9 +396,13 @@ export function createLocalTaskApiResponder(deps: {
         const { status, body } = await dispatch(taskService, msg.op);
         reply(msg.requestId, true, status, body);
       } catch (error) {
-        reply(msg.requestId, false, 503, {
-          error: `local task api op failed: ${error instanceof Error ? error.message : String(error)}`,
-        });
+        // 出站只带固定文案，不外泄内部错误文本；原始错误经 log 输出一行。
+        deps.log?.(
+          `local task api op failed (${msg.op.kind} ${msg.requestId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        reply(msg.requestId, false, 503, { error: "unavailable_host" });
       }
     },
   };

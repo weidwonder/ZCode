@@ -52,6 +52,7 @@ import {
   zcodeToolExecResourceSchema,
 } from "./zcode-protocol/index.js";
 import { zcodeTaskModeSchema } from "./zcode-task-mode-schema.js";
+import type { ZCodeTaskMode } from "./zcode-task-types-core.js";
 
 export {
   appSettingsOccupationEnum,
@@ -959,6 +960,31 @@ export type HostResourceUsageSnapshotRequestMessage = z.infer<
   typeof hostResourceUsageSnapshotRequestMessageSchema
 >;
 
+/** create op 的 mode 枚举：与 ZCodeTaskMode 全集一致（下方类型互检钉住）。 */
+const localTaskApiTaskModeSchema = z.enum([
+  "default",
+  "yolo",
+  "guarded",
+  "plan",
+  "edit",
+  "acceptEdits",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+  "autoEdit",
+  "build",
+]);
+/** 与 ZCodeTaskMode 全集双向互检：上游加/删值时这里编译失败，提示同步枚举。 */
+type _TaskModeEnumMatchesZCodeTaskMode = [
+  z.infer<typeof localTaskApiTaskModeSchema>,
+] extends [ZCodeTaskMode]
+  ? [ZCodeTaskMode] extends [z.infer<typeof localTaskApiTaskModeSchema>]
+    ? true
+    : never
+  : never;
+const taskModeEnumCheck: _TaskModeEnumMatchesZCodeTaskMode = true;
+void taskModeEnumCheck;
+
 /** 本机任务 API 的 op 参数（main 已解析 workspacePath，Host 不重复做路由）。 */
 export const localTaskApiRequestOpSchema = z.discriminatedUnion("kind", [
   z
@@ -966,7 +992,7 @@ export const localTaskApiRequestOpSchema = z.discriminatedUnion("kind", [
       kind: z.literal("create"),
       workspacePath: nonEmptyStringSchema,
       prompt: z.string(),
-      mode: nonEmptyStringSchema.optional(),
+      mode: localTaskApiTaskModeSchema.optional(),
       title: z.string().optional(),
     })
     .strict(),

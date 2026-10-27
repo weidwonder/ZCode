@@ -1859,6 +1859,7 @@ const hostResourceUsageResponder = createHostResourceUsageResponder({
 const localTaskApiResponder = createLocalTaskApiResponder({
   getServices: () => activeServices,
   post: (message) => parentPort?.postMessage(message),
+  log: (message) => logger.warn(message),
 });
 let activeSessionRealtimePort: ReturnType<typeof createTaskRealtimeBridgeForHostInit> = null;
 let hasDisposedHostResources = false;
