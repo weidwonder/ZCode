@@ -159,7 +159,7 @@ describe("localTaskApiResponder", () => {
     expect(mock.sendPrompt).toHaveBeenCalledWith(
       expect.objectContaining({ taskId: TASK_ID, content: "hello", clientMode: "desktop-continuous" }),
     );
-    const traceId = (mock.sendPrompt.mock.calls[0]?.[0] as { traceId: string }).traceId;
+    const traceId = (mock.sendPrompt.mock.calls[0]![0] as { traceId: string }).traceId;
     expect(traceId).toMatch(UUID_RE);
     expect(posted.at(-1)).toMatchObject({ ok: true, status: 202, body: { delivery: "sent" } });
   });
@@ -187,7 +187,7 @@ describe("localTaskApiResponder", () => {
       }),
     );
     expect(mock.promoteTaskCommand).not.toHaveBeenCalled();
-    const body = posted.at(-1)?.body as { delivery: string; commandId: string };
+    const body = posted.at(-1)!.body as { delivery: string; commandId: string };
     expect(body.delivery).toBe("queued");
     expect(body.commandId).toBeTruthy();
   });
@@ -214,13 +214,13 @@ describe("localTaskApiResponder", () => {
     expect(mock.promoteTaskCommand).toHaveBeenCalledWith(
       expect.objectContaining({ taskId: TASK_ID, clientMode: "desktop-continuous" }),
     );
-    const commandId = (posted.at(-1)?.body as { delivery: string; commandId: string }).commandId;
+    const commandId = (posted.at(-1)!.body as { delivery: string; commandId: string }).commandId;
     expect(commandId).toBeTruthy();
 
     await responder.handleRequest(
       request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
     );
-    const events = (posted.at(-1)?.body as { events: Array<{ type: string; commandId: string }> }).events;
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> }).events;
     expect(events.at(-1)).toMatchObject({ type: "input.steered", commandId });
   });
 
@@ -279,7 +279,7 @@ describe("localTaskApiResponder", () => {
     await running.responder.handleRequest(
       request("r1", { kind: "get", workspacePath: WORKSPACE, taskId: TASK_ID }),
     );
-    expect((running.posted.at(-1)?.body as { status: string }).status).toBe("running");
+    expect((running.posted.at(-1)!.body as { status: string }).status).toBe("running");
 
     const errored = createHarness();
     errored.mock.getTaskSnapshot.mockImplementation(async () =>
@@ -288,7 +288,7 @@ describe("localTaskApiResponder", () => {
     await errored.responder.handleRequest(
       request("r2", { kind: "get", workspacePath: WORKSPACE, taskId: TASK_ID }),
     );
-    expect((errored.posted.at(-1)?.body as { status: string }).status).toBe("error");
+    expect((errored.posted.at(-1)!.body as { status: string }).status).toBe("error");
   });
 
   it("get：快照 null → 404 task_not_found", async () => {
@@ -335,7 +335,7 @@ describe("localTaskApiResponder", () => {
     await responder.handleRequest(
       request("r1", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
     );
-    const all = posted.at(-1)?.body as {
+    const all = posted.at(-1)!.body as {
       events: unknown[];
       nextSeq: number;
       resync?: true;
@@ -385,7 +385,7 @@ describe("localTaskApiResponder", () => {
     );
 
     expect(posted.at(-1)).toMatchObject({ ok: false, status: 503 });
-    expect((posted.at(-1)?.body as { error: string }).error).toContain("boom");
+    expect((posted.at(-1)!.body as { error: string }).error).toContain("boom");
   });
 
   it("list：tasks 投影按 active 集合标 running/idle", async () => {
@@ -400,7 +400,7 @@ describe("localTaskApiResponder", () => {
       request("r1", { kind: "list", workspacePath: WORKSPACE }),
     );
 
-    const tasks = (posted.at(-1)?.body as { tasks: Array<Record<string, unknown>> }).tasks;
+    const tasks = (posted.at(-1)!.body as { tasks: Array<Record<string, unknown>> }).tasks;
     expect(tasks[0]).toMatchObject({ taskId: "a", title: "A", status: "running", updatedAt: 1 });
     expect(tasks[1]).toMatchObject({ taskId: "b", title: "B", status: "idle", updatedAt: 2 });
   });
