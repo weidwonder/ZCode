@@ -265,7 +265,7 @@ authority_refs:
 
 | 被取代物 | 删除任务 | 实测引用数 | 核销 |
 |---|---|---|---|
-| http.ts handleBotCallback 内联处理段（逻辑搬移到 services） | Task 2（函数保留为薄壳，无符号删除） | —（无引用变化） | ✅ 行为等价由回归测试证明 |
+| http.ts handleBotCallback 内联处理段（逻辑搬移到 services） | Task 2（函数保留为薄壳，无符号删除） | —（无引用变化） | ✅ 行为等价由回归测试证明（botsHttp.test.ts 既有 4 用例 + 新增 1 用例全绿） |
 
 ## 完成与自动合并
 - 评审门/合并门由派发者负责（任务书明示），本 plan 不含合并任务；worktree 与分支保留不删。

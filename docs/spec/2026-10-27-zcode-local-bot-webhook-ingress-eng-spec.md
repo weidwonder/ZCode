@@ -252,7 +252,7 @@ authority_refs:
 | AC-006 | UI：webhook 出现在新建列表（类型层面/渲染测试或最小组件断言）；secret 走 `webhookSecretValue` 保存 | FR-009/FR-010 |
 | AC-007 | i18n zh-CN/en-US 同 key 成对新增 | FR-011 |
 | AC-008 | `docs/bot-webhook-ingress.md`（英文）+ `docs/bots.md` 指针；只写产品与技术事实 | FR-012 |
-| AC-009 | `pnpm typecheck`、`pnpm lint`、相关包单测、`pnpm architecture:check --changed` 真跑并如实记录 | — |
+| AC-009 | `pnpm typecheck`、`pnpm lint`、相关包单测、`pnpm architecture:check --changed` 真跑并如实记录（2026-10-27 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；4 个测试文件 41 用例全绿；architecture:check --changed OK——三新文件经 unmanaged-new-file 例外登记） | — |
 | AC-010 | 新代码集中新文件：现有文件只加最小注册行（main/index.ts、host/index.ts、channels.ts、validation.ts、http.ts、BotsDialog.tsx、ProviderSettingsCard.tsx、index.ts(services)、i18n 两文件——均为小改） | FR-008~FR-011 |
 | AC-011 | 兼容取舍已由任务书拍板（§8.1）；无未拍板的既有行为变更 | — |
 
