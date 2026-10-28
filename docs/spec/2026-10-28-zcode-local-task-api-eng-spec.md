@@ -87,6 +87,9 @@ authority_refs:
 | windowWorkspaceMap（renderer SyncWindowTabs 上报，win.id→本地 workspace 集合） | `main/index.ts:658`；写入 `desktopMainIpcPlatform.ts:276-285` | 路由的间接上游（bus 的 workspaceKeys 源） | 同上 |
 | prepareAppQuit / whenReady 接线点 | `main/index.ts`（v1 已用同点，已回退） | server 生命周期 | 同上 |
 | architecture unmanaged-new-file 例外机制 | `architecture-policy.yaml:749`（exceptions） | 两个新 src 文件登记 | — |
+| `IModelSelectionService.getView()`（模型候选单一来源） | `packages/services/src/model-provider/providerFacadeServices.ts:95-98`；View 类型 `packages/provider/src/facades.ts:184-204` | /api/models 投影（FR-018） | 新增（本轮） |
+| GUI 新建对话模型菜单分组与思考档位投影 | `packages/ui/src/lib/modelSelectionGroups.ts:33-78`；`packages/ui/src/lib/modelThoughtOption.ts:5-34`（optionSpecs.reasoningLevel.values） | /api/models 与 GUI 同源的证据链 | 新增（本轮） |
+| `setModel`（任务换模型）与 GUI 运行中语义 | `packages/services/src/session/zcodeTaskService.ts:599-604`；adapter `zcodeTaskServiceAdapter.ts:2859-2873`；GUI 仅 Highspeed 锁（`SessionPane.tsx:4408-4415` toast「加速期间模型已锁定」） | POST /:id/model（FR-019） | 新增（本轮） |
 
 ### 1.1 功能需求（MUST 编号）
 
@@ -108,6 +111,9 @@ authority_refs:
 | FR-014 | 上游文档 `docs/local-task-api.md`（英文）+ dw 产物同步（卡片、CHANGELOG、决策记录）。 |
 | FR-015 | 带 :taskId 的端点（messages/stop/get/events）接受可选 workspacePath（GET 用 query `?workspacePath=`，POST 放 body）：归属表命中照旧；未命中且带了 workspacePath → 按该工作区路由，Host 用 `getTaskMeta({taskId, workspacePath})`（`zcodeTaskService.ts:526-530`，null 即不属于/不存在 → 404）校验，应答 2xx 时 Main 回填归属表；未命中且未带 → 404。events 缓冲重启后为空是预期（空事件 + 当前 nextSeq，客户端用 GET task 取状态）。 |
 | FR-016 | create 可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口——命中已完成的记 direct 返回同 `{taskId}`；**in-flight 期间并发同 id 请求 await 同一应答**（同 taskId 或同错误，不重复派发）；失败不缓存；并发数量 ZCode 侧不限流（调用方自限，见文档 Limitations）。 |
+| FR-017 | create 可选 `modelSelection`（strict schema：providerId/modelId 非空串、options 只许 reasoningLevel 非空串、多余键拒绝）：Main 先 safeParse 失败即 400（防 Host 侧 shared 拒绝导致 300s 悬挂，与 mode 同理由），合法值原样透传 `createTask` 的 `modelSelection`（deprecated 的 model/thoughtLevel 不用）。 |
+| FR-018 | `GET /api/models?workspacePath=`（鉴权同其它端点，workspace 必须已打开否则 409）：Host 经 `IModelSelectionService.getView()`（GUI 新建对话同源；分组先例 `ui/src/lib/modelSelectionGroups.ts:33`、思考档位 `ui/src/lib/modelThoughtOption.ts:16`、默认 automation 先例 `host/automationModelSelection.ts:23`）投影精简结构：`{providers:[{providerId, displayName, models:[{modelId, displayName, thoughtLevels: optionSpecs.reasoningLevel.values ?? [], isDefault}]}], preferred?}`；服务缺失 503。 |
+| FR-019 | `POST /api/tasks/:id/model` body `{modelSelection（必填，同 FR-017 strict 校验 400）, workspacePath?, clientRequestId?}`：归属校验（getTaskMeta null → 404）→ `setModel({taskId, traceId: 新 uuid, modelSelection})` → 200 `{ok:true}`；运行中允许换模型（GUI 语义，见偏离 #19）；clientRequestId 幂等 key=`model\0<taskId>\0<id>` 与 send 命名空间隔离。 |
 
 ## 2. 数据模型 / 数据结构
 
@@ -120,7 +126,9 @@ authority_refs:
     | { kind: "stop"; workspacePath: string; taskId: string }
     | { kind: "get"; workspacePath: string; taskId: string }
     | { kind: "events"; workspacePath: string; taskId: string; after: number; waitMs: number }
-    | { kind: "list"; workspacePath: string } }
+    | { kind: "list"; workspacePath: string }
+    | { kind: "setModel"; workspacePath: string; taskId: string; modelSelection: ModelSelection }
+    | { kind: "listModels"; workspacePath: string } }
   ```
   （workspacePath 由 Main 从归属表/请求解析后填入——Host 不重复解析路由。）
 - **host→main 应答** `LocalTaskApiResponse`：
@@ -150,12 +158,14 @@ authority_refs:
 | 接口 | 入参 | 出参 | 鉴权 |
 |---|---|---|---|
 | GET /health | — | 200 见 FR-003 | 无 |
-| POST /api/tasks | `{workspacePath, prompt, mode?, title?}` | 201 `{taskId}` / 409 | Bearer |
+| POST /api/tasks | `{workspacePath, prompt, mode?, title?, modelSelection?, clientRequestId?}` | 201 `{taskId}` / 400（mode/modelSelection/clientRequestId 非法） / 409 | Bearer |
 | POST /api/tasks/:id/messages | `{text, delivery?, workspacePath?}` | 202 `{delivery, commandId?}` / 404 / 409 | Bearer |
 | POST /api/tasks/:id/stop | body 可选 `{workspacePath?}` | 202 `{ok:true}` / 404 / 409 | Bearer |
 | GET /api/tasks/:id | query 可选 `?workspacePath=` | 200 任务摘要 / 404 / 409 | Bearer |
 | GET /api/tasks/:id/events | `after`, `waitMs`, query 可选 `?workspacePath=` | 200 `{events,nextSeq}` 或 `{resync:true}` / 404 / 409 | Bearer |
 | GET /api/tasks?workspacePath= | query | 200 `{tasks:[…]}` / 409 | Bearer |
+| GET /api/models?workspacePath= | query（workspacePath 必填） | 200 `{providers:[…], preferred?}` / 400 / 409 | Bearer |
+| POST /api/tasks/:id/model | `{modelSelection, workspacePath?, clientRequestId?}` | 200 `{ok:true}` / 400 / 404 / 409 | Bearer |
 
 > `workspacePath`（可选）的语义（FR-015）：归属表未命中时的重新锚定入口——Host 用 `getTaskMeta` 核实任务确属该工作区，2xx 应答即回填归属表，之后的请求可省略。
 
@@ -194,6 +204,8 @@ authority_refs:
 6. **Main 路由**：`resolveHostByWorkspace(path)` 遍历 taskRealtimeBus hosts 注册表的 `workspaceKeys`（key = workspacePath，本地 workspace identity 为空）取 `child`（utilityProcess 直接可 postMessage）；无 → 409。dispatcher 复用 v1 形态（requestId + pending Map + 300s 兜底——events 的 waitMs≤30s 远小于兜底）。
 7. **taskId 重锚定（FR-015）**：Main 的 `resolveTaskWorkspace`——归属表命中用表值；未命中且请求带非空 workspacePath 用该值路由，Host 在 send/stop/events op 前置 `getTaskMeta({taskId, workspacePath})` 校验（null → 404，不调任何写操作；get op 的 getTaskSnapshot null 同效），Main 收到 2xx 应答且该请求未走表时回填 `taskWorkspaceByTaskId`。重启后首个请求带 workspacePath 即恢复接续（事件缓冲为空，GET task 可取全量状态）。
 7. **鉴权**：`sha256(configToken)` vs `sha256(headerToken)` 后 `crypto.timingSafeEqual`。
+8. **listModels op**（FR-018）：Host `getOptional(IModelSelectionService)`（本地容器装配 `services/src/node.ts:2984`；缺失 → 503）→ `getView()`（模型候选即 `view.providers[].models[]`，GUI 分组先例只做展示不改变候选集）→ 投影：每模型 `thoughtLevels = config.optionSpecs?.reasoningLevel?.values ?? []`（GUI 投影先例 `resolveModelThoughtOption`，缺失/空 → 无档位）、`isDefault` 按顶层 `preferredSelection` 的 providerId+modelId 命中、`displayName` 回落 providerId/modelId；顶层 `preferred` 原样透传（可直接作为 create 的 modelSelection）。不做 GUI 的 selectedProvider 菜单过滤（偏离 #18）。
+9. **setModel op**（FR-019）：getTaskMeta 归属校验（null → 404，与 send/stop/events 同模式）→ `setModel({taskId, traceId: 新 uuid, modelSelection})`（adapter 直发 agent runtime，`zcodeTaskServiceAdapter.ts:2859-2873`）→ 200 `{ok:true}`（返回的 configOptions 不透出）。运行中不禁止（GUI 语义，偏离 #19）。
 
 **设计自检**：新消息对（跨进程必需，FR-011/012）；Host 事件 buffer（Main 不承载业务状态——AGENTS.md；FR-009）；Main 归属表（taskId 无 workspace 反查接口，HTTP URL 又只有 taskId——FR-011）；409 而非自动打开（A2：自动打开需 createWindow+renderer 开 tab+等上报，时机不确定；409 查表即答）。**备选方案**：事件 buffer 放 Main（否——业务状态进 Main 违反仓库架构）；按 taskId 广播全 Host 解析 workspace（否——无接口支撑且时序不定）。
 
@@ -257,13 +269,14 @@ authority_refs:
 | AC-003 | Host responder 单测（mock IZCodeTaskService，类型绑定 Pick 面）：create 参数形态（deferPersistenceUntilFirstPrompt、clientMode）、send 三 delivery（requestedDelivery 断言：auto 无/queue/steer=guide）、steer 流事件投影（input.steered/steer.injected/steer.fellBack）、rename 在 sendPrompt 后、stop、五态投影、events 立即返回/长轮询唤醒/resync、input.queued 事件 | FR-005~FR-010, FR-012 |
 | AC-004 | Main 路由单测：归属表 miss→404、无 Host→409/503、dispatcher requestId 回流/超时 | FR-011 |
 | AC-005 | 上游文档 + dw 产物（卡片/CHANGELOG/决策记录/v1 spec 转 superseded） | FR-014 |
-| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。第三轮修复后实测（2026-10-28 第三轮）：typecheck 0 错；Main 30 + Host 28 共 58 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。真机反馈修复后实测（2026-10-28 真机轮）：typecheck 0 错；Host 28 + Main 30 共 58 例全绿。第五轮修复后实测（2026-10-28 第五轮）：typecheck 0 错；Main 35 + Host 31 共 66 例全绿；lint 0 errors（96 条存量 warnings）；architecture:check 0 违规；lint-cards 0 违规；clientRequestId 幂等抽独立模块 localTaskApiClientRequestId.ts（Main 文件回到 800 行限内）） | — |
+| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。第三轮修复后实测（2026-10-28 第三轮）：typecheck 0 错；Main 30 + Host 28 共 58 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。真机反馈修复后实测（2026-10-28 真机轮）：typecheck 0 错；Host 28 + Main 30 共 58 例全绿。第五轮修复后实测（2026-10-28 第五轮）：typecheck 0 错；Main 35 + Host 31 共 66 例全绿；lint 0 errors（96 条存量 warnings）；architecture:check 0 违规；lint-cards 0 违规；clientRequestId 幂等抽独立模块 localTaskApiClientRequestId.ts（Main 文件回到 800 行限内）。模型选择轮实测（2026-10-28 第六轮）：typecheck 0 错；Main 44 + Host 37 共 81 例全绿；lint 0 errors / 96 条存量 warnings；architecture:check 0 违规（新拆 localTaskApiHttpUtil.ts / localTaskApiModelRoutes.ts 登记例外）；lint-cards 0 违规） | — |
 | AC-007 | 日志断言：拒绝路径计数、无 prompt 内容 | FR-013 |
 | AC-008 | 重锚定测试：重启（表空）后带 workspacePath 续聊成功且回填（后续请求可省略）；带错 workspacePath 404 透传且不回填；不带 404；Host 侧 send/stop/events 对不属于该 workspace 的任务 404 且不触发写操作 | FR-015 |
 | AC-009 | 评审轮补充测试：create 部分失败（sendPrompt reject）仍 201 带 warning 且 taskId 可用；订阅建立失败不影响 201；auto/queue 受理后 buffer 即有 input.queued；waiting_input 五态分支；mode 非法 400；clientRequestId 命中返回同 taskId 不再派发；Host 退出结清在飞请求；终态后流订阅释放；op 异常出站固定文案 + 日志留痕 | FR-005/FR-013/FR-016 及评审项 |
 | AC-010 | 第三轮补充测试：长轮询唤醒只含 after 之后的新事件；懒重建后 after>0 回 `{resync:true}`、after=0 得空事件；rename 失败 201 带 `rename_failed`（与 first_prompt_failed 优先级）；clientRequestId 并发同 id 只派发一次且两请求同 taskId、失败不缓存。第五轮补充：CLI 真实形状下 `input.steered.commandId === 202 应答 commandId`（inputId 关联）；空闲任务 steer 应答 sent；messages clientRequestId 同 create 语义（命中回首次应答、in-flight 共享、失败不缓存） | r3-37 #3、r3-39 #1/#2/#3/#4 |
+| AC-011 | 模型选择测试：create modelSelection 非法三形状 400 不 dispatch / 合法透传；GET /api/models 403/401/400/409/200 透传与 op 深等；POST /:id/model 400 先于 404、归属 miss 404、重锚定透传、幂等代答与失败不缓存；responder create 透传、listModels 投影深等（displayName 回落/thoughtLevels 缺省/isDefault/preferred）、服务缺失 503、setModel 404 前置/成功参数（uuid traceId）/抛错 503 固定文案 | FR-017/FR-018/FR-019 |
 
-**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003/AC-009；FR-006→AC-003/AC-010；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003/AC-010；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007/AC-009；FR-014→AC-005；FR-015→AC-008；FR-016→AC-009/AC-010。
+**覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003/AC-009；FR-006→AC-003/AC-010；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003/AC-010；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007/AC-009；FR-014→AC-005；FR-015→AC-008；FR-016→AC-009/AC-010；FR-017→AC-011；FR-018→AC-011；FR-019→AC-011。
 
 
 
@@ -285,8 +298,12 @@ authority_refs:
 | 12 | create 接受可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口，命中直接返回同一 `{taskId}` 不再派发 | 评审拍板②；create 有真实 agent 运行成本，HTTP 超时盲重试不应重复建任务 |
 | 13 | create 部分失败仍回 `201 {taskId, warning}`：`first_prompt_failed`（首条 prompt 失败，此时跳过 rename）优先于 `rename_failed`（sendPrompt 后 rename 失败）；订阅建立失败不影响 201。rename 在 sendPrompt 之后执行——defer 模式下 session 随首条 prompt 落盘（真机日志：此前 renameSession 报 Session not found after write） | 副作用可见可接续；title 是对账锚点 |
 | 14 | Host 退出时 Main 立即结清该 Host 的在飞请求（503），不等 300s 兜底；并发数量 ZCode 侧不限流（文档写明由调用方自限）；开关文件 group/other 可读仅 warn 不拒启 | 评审拍板③④与 r2-29 #3 |
-| 15 | steer 的 promote 失败 → `202 {delivery:"queued", commandId, warning:"promote_failed"}` 并照发 `input.queued` 事件 | 评审 r3-39 #1：enqueue 已成功、命令会被执行，与 create 部分失败同型——副作用可见，防重试重复入队 |
+| 15 | （已并入 #2/#8——enqueue+promote 近似随真机轮废弃，promote_failed 分支不复存在） | r3-39 #1 的场景随路径消失 |
 | 16 | clientRequestId 并发同 id：in-flight 期间后续请求 await 同一应答（同 taskId 或同错误），不重复派发；失败不缓存（后续请求可重试） | 评审 r3-39 #3：HTTP 超时早于 create 应答时重试落进 in-flight 窗口，占位共享才能保证幂等 |
+| 17 | create 的 `modelSelection` 用 shared strict schema 双层校验（Main safeParse 先 400 + Host 侧 schema），形状=ModelSelection：`{providerId, modelId, options?{reasoningLevel}}`，多余键/空串拒绝；deprecated 的 model/thoughtLevel 不暴露 | 上级 2026-10-28 追加需求；strict 拒绝发生在 Host 侧会悬挂 300s，Main 先 400 |
+| 18 | /api/models 返回精简投影：`{providers:[{providerId, displayName(回落 providerId), models:[{modelId, displayName=modelId, thoughtLevels(缺失→[]), isDefault}]}], preferred?}`；不做 GUI 的 selectedProvider 菜单过滤；仍按 workspace 路由到拥有 Host（getView 本身不吃 workspace，但路由/409/鉴权语义与其余端点一致） | 上级要求复用 GUI 同源（IModelSelectionService.getView + buildRegistryModelSelectGroups/resolveModelThoughtOption 投影链）不自行拼装；view.providers 即 Registry 执行目录 |
+| 19 | POST /:id/model 运行中**允许**换模型（不加 409）：GUI 普通运行中不锁模型（SessionPane 仅 Highspeed 卡激活时锁并 toast）；Highspeed 是 UI 运行态 Host 侧不可见，agent 侧拒绝时表现为 503 unavailable_host；setModel 返回的 configOptions 不透出 | 上级条件句「GUI 若禁止则 409」经调查不成立；configOptions 是 GUI 投影面，API 不需要 |
+| 20 | /:id/model 的 clientRequestId 幂等为独立 model 命名空间（key=`model\0<taskId>\0<id>`），与 send/create 均隔离 | 同一 clientRequestId 先用于 messages 再用于换模型不应互相代答 |
 
 ## 13. 过稿记录（MUST）
 
