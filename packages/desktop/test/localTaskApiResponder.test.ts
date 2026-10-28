@@ -215,8 +215,9 @@ describe("localTaskApiResponder", () => {
     expect(body.commandId).toMatch(UUID_RE);
   });
 
-  it("send steer：sendPrompt 带 requestedDelivery=guide，应答 delivery=steered，受理时无自产事件", async () => {
+  it("send steer（运行中）：sendPrompt 带 requestedDelivery=guide，应答 delivery=steered，受理时无自产事件", async () => {
     const { responder, posted, mock } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]); // 运行中：steer 语义保留
 
     await responder.handleRequest(
       request("r1", {
@@ -246,10 +247,13 @@ describe("localTaskApiResponder", () => {
     const events = (posted.at(-1)!.body as { events: Array<{ type: string }> }).events;
     // 受理不自产 input.steered：由 turn_steer_queued 流事件投影统一发出。
     expect(events.some((event) => event.type === "input.steered")).toBe(false);
+    // 运行态判定确实做了：steer 应答前查过 active 集合（空闲时会降级为 sent，另有用例）。
+    expect(mock.listActiveTaskIds).toHaveBeenCalledWith({ workspacePath: WORKSPACE });
   });
 
-  it("steer 权威投影：turn_steer_queued → input.steered(pendingInputId)；status drained/discarded → injected/fellBack", async () => {
-    const { responder, posted, eventListeners } = createHarness();
+  it("steer 权威投影：turn_steer_queued 的 inputId → input.steered(commandId)；status drained/discarded → injected/fellBack", async () => {
+    const { responder, posted, eventListeners, mock } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]); // 运行中：steer 语义保留
     // send 受理即补订阅：listener 已就位，直接投递 CLI 流事件。
     await responder.handleRequest(
       request("r1", {
@@ -261,7 +265,8 @@ describe("localTaskApiResponder", () => {
       }),
     );
 
-    eventListeners[0]!({ type: "turn_steer_queued", pendingInputId: "pi-1" });
+    // CLI 真实形状：pendingInputId 带 "queue_" 前缀，inputId=envelope.commandId 才与应答可对账。
+    eventListeners[0]!({ type: "turn_steer_queued", pendingInputId: "queue_pi-1", inputId: "pi-1" });
     eventListeners[0]!({ type: "turn_steer_status", status: "drained" });
     eventListeners[0]!({ type: "turn_steer_status", status: "discarded", reason: "turn ended" });
 
@@ -277,6 +282,94 @@ describe("localTaskApiResponder", () => {
     expect(events.some((event) => event.type === "steer.injected")).toBe(true);
     const fellBack = events.find((event) => event.type === "steer.fellBack");
     expect(fellBack).toMatchObject({ type: "steer.fellBack", error: "turn ended" });
+  });
+
+  it("send steer（运行中）CLI 真实形状：input.steered.commandId 与 202 应答 commandId 对账（不被 queue_ 前缀污染）", async () => {
+    const { responder, posted, mock, eventListeners } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]); // 运行中：steer 语义保留
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "steer",
+      }),
+    );
+    const accepted = posted.at(-1)!.body as { delivery: string; commandId: string };
+    expect(accepted.delivery).toBe("steered");
+
+    // P1 核心：CLI admission 给 pendingInputId 加 "queue_" 前缀（command-inbox），
+    // inputId=envelope.commandId 才与 202 应答相等；修复前会投影成 "queue_<commandId>"。
+    eventListeners[0]!({
+      type: "turn_steer_queued",
+      pendingInputId: `queue_${accepted.commandId}`,
+      inputId: accepted.commandId,
+    });
+
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId?: string }> })
+      .events;
+    const steered = events.find((event) => event.type === "input.steered");
+    expect(steered).toMatchObject({ type: "input.steered", commandId: accepted.commandId });
+    expect(steered!.commandId).not.toBe(`queue_${accepted.commandId}`);
+  });
+
+  it("send steer（空闲）：CLI 空闲分支不看 delivery 直接普通起轮且不发 steer 事件 → 按实际去向应答 sent（拍板 r6-52 #2②）", async () => {
+    const { responder, posted, mock } = createHarness(); // listActiveTaskIds 默认 []：任务空闲
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "steer",
+      }),
+    );
+
+    expect(mock.listActiveTaskIds).toHaveBeenCalledWith({ workspacePath: WORKSPACE });
+    // 降级为普通发送：不带 requestedDelivery（跟随会话 followupMode）。
+    const params = mock.sendPrompt.mock.calls[0]![0] as { requestedDelivery?: string };
+    expect(params.requestedDelivery).toBeUndefined();
+    const body = posted.at(-1)!.body as { delivery: string; commandId: string };
+    expect(body.delivery).toBe("sent");
+    expect(body.commandId).toMatch(UUID_RE);
+    // 普通发送受理自产 input.queued（运行中 steer 才不自产）。
+    await responder.handleRequest(
+      request("r3", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> })
+      .events;
+    expect(events.at(-1)).toMatchObject({ type: "input.queued", commandId: body.commandId });
+  });
+
+  it("steer 投影回落：旧 CLI 事件无 inputId → 兜底投影 pendingInputId", async () => {
+    const { responder, posted, mock, eventListeners } = createHarness();
+    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "steer",
+      }),
+    );
+
+    eventListeners[0]!({ type: "turn_steer_queued", pendingInputId: "pi-legacy" });
+
+    await responder.handleRequest(
+      request("r4", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId?: string }> })
+      .events;
+    expect(
+      events.some((event) => event.type === "input.steered" && event.commandId === "pi-legacy"),
+    ).toBe(true);
   });
 
   it("stop：stopGeneration 以 {taskId, workspacePath} 调用，应答 202", async () => {

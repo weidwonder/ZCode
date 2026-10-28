@@ -162,8 +162,10 @@ export function createLocalTaskApiResponder(deps: {
           } else if (event.type === "task_error") {
             appendTurnFailed(taskId, String((event as { error?: unknown }).error ?? "task failed"));
           } else if (event.type === "turn_steer_queued") {
-            // CLI 已把 guide 请求排入引导（pendingInputId 与受理 commandId 同源：traceId 即 inputId）。
-            appendEvent(taskId, { type: "input.steered", commandId: event.pendingInputId });
+            // CLI 已把 guide 请求排入引导：事件 inputId=envelope.commandId=202 应答的 commandId，
+            // 与应答可对账；pendingInputId 是 "queue_<commandId>"（admission 加前缀），不相等。
+            // 旧 CLI 形状无 inputId 时回落 pendingInputId 兜底。
+            appendEvent(taskId, { type: "input.steered", commandId: event.inputId ?? event.pendingInputId });
           } else if (event.type === "turn_steer_status") {
             if (event.status === "drained") {
               appendEvent(taskId, { type: "steer.injected" });
@@ -297,6 +299,15 @@ export function createLocalTaskApiResponder(deps: {
       // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
       const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
       if (!meta) return { status: 404, body: { error: "task_not_found" } };
+      // 空闲任务收到 steer：CLI 空闲分支不看 delivery、直接普通起轮且不发 steer 事件——按
+      // 实际去向应答 sent（拍板 r6-52 #2②），普通发送不发 guide；运行中才交 CLI guide 裁决。
+      let effectiveDelivery = op.delivery;
+      if (op.delivery === "steer") {
+        const active = await taskService.listActiveTaskIds({ workspacePath: op.workspacePath });
+        if (!active.includes(op.taskId)) {
+          effectiveDelivery = "auto";
+        }
+      }
       // 与 GUI 运行中发送同一条链路：v4 sendText 的 requestedDelivery 交给 CLI inputRouting
       // 裁决（guide→steering 裁决 steered/fellBack，queue→入队，缺省→按会话 followupMode）。
       // auto 不带参数=跟随会话 followupMode（GUI 运行中默认发送行为）；
@@ -307,8 +318,8 @@ export function createLocalTaskApiResponder(deps: {
         traceId: commandId,
         content: op.text,
         clientMode: "desktop-continuous",
-        ...(op.delivery === "queue" ? { requestedDelivery: "queue" as const } : {}),
-        ...(op.delivery === "steer" ? { requestedDelivery: "guide" as const } : {}),
+        ...(effectiveDelivery === "queue" ? { requestedDelivery: "queue" as const } : {}),
+        ...(effectiveDelivery === "steer" ? { requestedDelivery: "guide" as const } : {}),
       });
       // 受理即补订阅：保证 steer 的权威流事件（input.steered / steer.*）能进 buffer；
       // 失败不致命（首次 events 调用懒订阅兜底），只是这批事件可能不被记录。
@@ -318,14 +329,20 @@ export function createLocalTaskApiResponder(deps: {
         // 懒订阅兜底由首次 events 调用承担
       }
       // auto/queue 的受理事件自产（CLI 无对应专属流事件）；steer 的 input.steered 统一由
-      // turn_steer_queued 流事件投影发出（CLI 的 pendingInputId 即我们的 commandId）。
-      if (op.delivery !== "steer") {
+      // turn_steer_queued 流事件投影发出（CLI 事件的 inputId=envelope.commandId 即我们的
+      // commandId，可与 202 应答对账；旧 CLI 无 inputId 时回落 pendingInputId）。
+      if (effectiveDelivery !== "steer") {
         appendEvent(op.taskId, { type: "input.queued", commandId });
       }
       return {
         status: 202,
         body: {
-          delivery: op.delivery === "auto" ? "sent" : op.delivery === "queue" ? "queued" : "steered",
+          delivery:
+            effectiveDelivery === "auto"
+              ? "sent"
+              : effectiveDelivery === "queue"
+                ? "queued"
+                : "steered",
           commandId,
         },
       };

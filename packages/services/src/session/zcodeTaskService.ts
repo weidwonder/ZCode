@@ -301,7 +301,7 @@ export interface IZCodeTaskService {
       clientId?: string;
       clientLabel?: string;
       clientMode?: ZCodeTaskClientMode;
-      /** 与 GUI v4 sendText 的 requestedDelivery 同义：缺省由 CLI 按会话 followupMode 裁决；"queue" 入队、"guide" 运行中引导（steer）、"startNow" 原子抢占。 */
+      /** 与 GUI v4 sendText 的 requestedDelivery 同义：缺省由 CLI 按会话 followupMode 裁决；"queue" 入队、"guide" 运行中引导（steer）、"startNow" 原子抢占。带 attachments 时本参数不生效（走 legacy 发送路径，delivery 意图丢弃，待 v4 附件命令面）。 */
       requestedDelivery?: "startNow" | "queue" | "guide";
       /** 当前 turn 额外隐藏的工具；与 session/automation 自带的工具隔离规则合并。 */
       toolDenylist?: string[];
