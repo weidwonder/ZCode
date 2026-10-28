@@ -35,7 +35,7 @@ authority_refs:
 - `HostMessageTypes.LocalTaskApiRequest = "local-task-api-request"`；`HostResponseTypes.LocalTaskApiResponse = "local-task-api-response"`。
 - zod schema `localTaskApiRequestOpSchema`（discriminated by kind）与两个消息 schema（spec §2 形状）+ TS 类型导出 `HostLocalTaskApiRequestMessage` / `HostLocalTaskApiResponseMessage`。
 - `createLocalTaskApiResponder(deps: { getServices, post, now?, randomUUID? })` → `{ handleRequest(msg) }`。
-- 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|"enqueueTaskCommand"|"promoteTaskCommand"|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（签名变化编译红）。
+- 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|""|""|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（签名变化编译红）。
 
 **要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询（唤醒按各 waiter 的 after 过滤）+ resync）；订阅生命周期（create/send 受理时建立，任务终态后 10 分钟整体释放订阅与缓冲（懒重建，after>0 回 resync）；其余随 Host 进程退出回收——responder 不单独接入 disposeHostResources 链，属有意取舍）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false（出站固定文案，原文进日志）。
 

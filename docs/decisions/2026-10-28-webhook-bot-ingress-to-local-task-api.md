@@ -27,7 +27,7 @@ authority_refs:
 
 ## 现在的方案
 
-本机任务 API（契约 v2）：Main 进程起 loopback HTTP，按 workspace 路由到拥有它的窗口 Host，Host 直接调 `IZCodeTaskService`（createTask / sendPrompt / enqueueTaskCommand / promoteTaskCommand / stopGeneration / getTaskSnapshot / 事件订阅）。经它建的任务就是普通桌面对话——GUI 可见、可并行、可在 GUI 接管。
+本机任务 API（契约 v2）：Main 进程起 loopback HTTP，按 workspace 路由到拥有它的窗口 Host，Host 直接调 `IZCodeTaskService`（createTask / sendPrompt（r5 起含 requestedDelivery 引导原语，enqueue/promote 已废弃）/ stopGeneration / getTaskSnapshot / 事件订阅）。经它建的任务就是普通桌面对话——GUI 可见、可并行、可在 GUI 接管。
 
 ## 处置
 

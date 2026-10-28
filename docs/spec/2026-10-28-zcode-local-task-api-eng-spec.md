@@ -77,9 +77,9 @@ authority_refs:
 
 | 既有模块 / 机制 | 出处 | 本次怎么碰到 | 卡片 |
 |---|---|---|---|
-| `IZCodeTaskService`（createTask/sendPrompt/enqueueTaskCommand/promoteTaskCommand/stopGeneration/getTaskSnapshot/getTaskMeta/listTasks/listActiveTaskIds/renameTask/onDynamicTaskEvent/onDynamicTaskTerminalOutcome） | `packages/services/src/session/zcodeTaskService.ts:185-780` | Host responder 的全部业务面 | `cards/ZCode/desktop-host-ipc.md`（本次扩为 host 任务面）+ 新域卡 |
+| `IZCodeTaskService`（createTask/sendPrompt/enqueueTaskCommand/promoteTaskCommand/stopGeneration/getTaskSnapshot/getTaskMeta/listTasks/listActiveTaskIds/renameTask/onDynamicTaskEvent/onDynamicTaskTerminalOutcome） | `packages/services/src/session/zcodeTaskService.ts:185-780` | Host responder 业务面（r5 起不含 enqueue/promote） | `cards/ZCode/desktop-host-ipc.md`（本次扩为 host 任务面）+ 新域卡 |
 | 无界面派发先例（createTask+sendPrompt 参数模式） | `packages/desktop/src/host/index.ts:742-755, 777-804` | 照抄参数形态（deferPersistenceUntilFirstPrompt、clientMode desktop-continuous） | 同上 |
-| running 判定（listActiveTaskIds） | `zcodeTaskService.ts:448-456`；使用先例 `host/index.ts:700-705` | send op 分流与 get 五态 | 同上 |
+| running 判定（listActiveTaskIds） | `zcodeTaskService.ts:448-456`；使用先例 `host/index.ts:700-705` | get 五态（send op r5 起不再分流，steer 空闲判定除外） | 同上 |
 | waiting 判定（runtime 快照字段） | `packages/shared/src/zcode-task-types-core.ts`（ZCodeSessionRuntimeSnapshot 的 pendingPermissions/pendingElicitations，约 1013-1047 行） | get 五态 | 同上 |
 | 流事件类型判别（task_run_started/task_complete/task_error/permission_request…） | `zcode-task-types-core.ts:456-988` | 事件投影 | 同上 |
 | main→host requestId postMessage 模式 | `resourceManagerHostSampling.ts`（先例）；v1 已实现过同型 dispatcher（本分支 75f60bd3 回退前） | dispatcher 重建 | 同上 |
@@ -96,11 +96,11 @@ authority_refs:
 | FR-002 | 监听只绑 `127.0.0.1:<port>`，全应用唯一（Main）；端口占用 warn 不崩；prepareAppQuit 关闭。 |
 | FR-003 | `GET /health` → 200 `{"ok":true,"api":"zcode-local-task-api","version":2,"zcodeVersion":"<app version>"}`，无鉴权。 |
 | FR-004 | 除 /health 外：Host 头白名单（403，读 body 前）→ Bearer token 常量时间比较（401）→ POST Content-Type 必须含 application/json（415）→ body ≤16 MiB（413）；无 CORS 头；其它方法 405、路径 404。 |
-| FR-005 | `POST /api/tasks` `{workspacePath, prompt, mode?, title?, clientRequestId?}` → 201 `{taskId}`：Host 侧 createTask（deferPersistenceUntilFirstPrompt）→ 可选 renameTask(title) → 订阅事件（失败不致命）→ sendPrompt 首条（失败仍 201 带 `warning:"first_prompt_failed"`）；workspace 无拥有 Host → 409 `workspace_not_open`。`mode` 双层枚举白名单（Main body 校验 + shared schema，对齐 `ZCodeTaskMode` 全集，非法 400）。 |
-| FR-006 | `POST /api/tasks/:id/messages` `{text, delivery?:auto\|queue\|steer}` → 202 `{delivery:"sent"\|"queued"\|"steered", commandId}`：全部走 `sendPrompt`（底层 v4 sendText）——auto 不带 requestedDelivery（CLI 按会话 followupMode 裁决，= GUI 运行中默认发送）；queue 带 `"queue"`；steer 带 `"guide"`（CLI 即时引导注入，结果经事件流回报 `input.steered`/`steer.injected`/`steer.fellBack`）；taskId 未知 → 404。 |
+| FR-005 | `POST /api/tasks` `{workspacePath, prompt, mode?, title?, clientRequestId?}` → 201 `{taskId}`：Host 侧 createTask（deferPersistenceUntilFirstPrompt）→ 订阅事件（失败不致命）→ sendPrompt 首条（失败仍 201 带 `warning:"first_prompt_failed"` 并跳过 rename）→ title 非空且首条成功则此刻 renameTask；workspace 无拥有 Host → 409 `workspace_not_open`。`mode` 双层枚举白名单（Main body 校验 + shared schema，对齐 `ZCodeTaskMode` 全集，非法 400）。 |
+| FR-006 | `POST /api/tasks/:id/messages` `{text, delivery?:auto\|queue\|steer, clientRequestId?, workspacePath?}` → 202 `{delivery:"sent"\|"queued"\|"steered", commandId}`（空闲任务收到 steer 时按实际去向应答 `sent`；clientRequestId 与 create 同语义：key=task+id、10 分钟去重、in-flight 共享应答、命中回首次应答、失败不缓存）：全部走 `sendPrompt`（底层 v4 sendText）——auto 不带 requestedDelivery（CLI 按会话 followupMode 裁决，= GUI 运行中默认发送）；queue 带 `"queue"`；steer 带 `"guide"`（CLI 即时引导注入，结果经事件流回报 `input.steered`/`steer.injected`/`steer.fellBack`）；taskId 未知 → 404。 |
 | FR-007 | `POST /api/tasks/:id/stop` → 202（stopGeneration）；未知 → 404。 |
 | FR-008 | `GET /api/tasks/:id` → `{taskId, workspacePath, title, status, turnCount, lastAssistantText, updatedAt}`；五态映射见 §4；快照不存在 → 404。 |
-| FR-009 | `GET /api/tasks/:id/events?after=<seq>&waitMs=<0..30000>` → `{events:[{seq,type,at,…}], nextSeq}`；长轮询至 waitMs；无历史可回放 → `{resync:true}`；事件 7 类见 §2。 |
+| FR-009 | `GET /api/tasks/:id/events?after=<seq>&waitMs=<0..30000>` → `{events:[{seq,type,at,…}], nextSeq}`；长轮询至 waitMs；无历史可回放 → `{resync:true}`；事件 9 类见 §2。 |
 | FR-010 | `GET /api/tasks?workspacePath=...` → `{tasks:[{taskId,title,status,updatedAt}]}`（listTasks 精简投影）。 |
 | FR-011 | 多窗口路由：按 workspaceKey（= 本地 workspacePath）经 taskRealtimeBus hosts 注册表找拥有 Host；找不到 → 409；Main 维护 taskId→workspacePath 归属表（仅本 API 创建的任务）。 |
 | FR-012 | Host responder 用真实 `IZCodeTaskService` 类型（`Pick` 面）；上游签名变化编译失败。 |
@@ -139,7 +139,9 @@ authority_refs:
     | { seq: number; type: "turn.failed"; at: number; error: string }
     | { seq: number; type: "permission.requested"; at: number; summary: string }
     | { seq: number; type: "input.queued"; at: number; commandId: string }
-    | { seq: number; type: "input.steered"; at: number; commandId: string };
+    | { seq: number; type: "input.steered"; at: number; commandId: string }
+  | { seq: number; type: "steer.injected"; at: number }
+  | { seq: number; type: "steer.fellBack"; at: number; error: string };
   ```
   seq 每 task 从 1 单调；ring buffer 每 task 上限 500 条。
 
@@ -255,11 +257,11 @@ authority_refs:
 | AC-003 | Host responder 单测（mock IZCodeTaskService，类型绑定 Pick 面）：create 参数形态（deferPersistenceUntilFirstPrompt、clientMode）、send 三 delivery（requestedDelivery 断言：auto 无/queue/steer=guide）、steer 流事件投影（input.steered/steer.injected/steer.fellBack）、rename 在 sendPrompt 后、stop、五态投影、events 立即返回/长轮询唤醒/resync、input.queued 事件 | FR-005~FR-010, FR-012 |
 | AC-004 | Main 路由单测：归属表 miss→404、无 Host→409/503、dispatcher requestId 回流/超时 | FR-011 |
 | AC-005 | 上游文档 + dw 产物（卡片/CHANGELOG/决策记录/v1 spec 转 superseded） | FR-014 |
-| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。第三轮修复后实测（2026-10-28 第三轮）：typecheck 0 错；Main 30 + Host 28 共 58 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。真机反馈修复后实测（2026-10-28 真机轮）：typecheck 0 错；Host 28 + Main 30 共 58 例全绿；lint/architecture/lint-cards 同口径全绿） | — |
+| AC-006 | typecheck / lint / 相关单测 / architecture:check --changed 真跑记录（2026-10-28 实测：typecheck 0 错；lint 0 errors / 96 条存量 warnings（本次文件零命中）；Host responder 16 用例 + Main 17 用例共 33 例全绿；architecture:check --changed OK——两新 src 文件经 unmanaged-new-file 例外登记；ctx lint-cards 0 违规。评审修复轮后实测（2026-10-28 第二轮）：typecheck 0 错；Main 28 + Host 24 共 52 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。第三轮修复后实测（2026-10-28 第三轮）：typecheck 0 错；Main 30 + Host 28 共 58 例全绿；lint 0 errors / 96 条存量 warnings 零命中；architecture:check --changed 0 违规；lint-cards 0 违规。真机反馈修复后实测（2026-10-28 真机轮）：typecheck 0 错；Host 28 + Main 30 共 58 例全绿。第五轮修复后实测（2026-10-28 第五轮）：typecheck 0 错；Main 35 + Host 31 共 66 例全绿；lint 0 errors（96 条存量 warnings）；architecture:check 0 违规；lint-cards 0 违规；clientRequestId 幂等抽独立模块 localTaskApiClientRequestId.ts（Main 文件回到 800 行限内）） | — |
 | AC-007 | 日志断言：拒绝路径计数、无 prompt 内容 | FR-013 |
 | AC-008 | 重锚定测试：重启（表空）后带 workspacePath 续聊成功且回填（后续请求可省略）；带错 workspacePath 404 透传且不回填；不带 404；Host 侧 send/stop/events 对不属于该 workspace 的任务 404 且不触发写操作 | FR-015 |
-| AC-009 | 评审轮补充测试：create 部分失败（sendPrompt reject）仍 201 带 warning 且 taskId 可用；订阅建立失败不影响 201；send 受理后 buffer 即有 input.queued；waiting_input 五态分支；mode 非法 400；clientRequestId 命中返回同 taskId 不再派发；Host 退出结清在飞请求；终态后流订阅释放；op 异常出站固定文案 + 日志留痕 | FR-005/FR-013/FR-016 及评审项 |
-| AC-010 | 第三轮补充测试：长轮询唤醒只含 after 之后的新事件；懒重建后 after>0 回 `{resync:true}`、after=0 得空事件；steer promote 失败回 `202 queued+promote_failed` 且发 `input.queued`；rename 失败 201 带 `rename_failed`（与 first_prompt_failed 优先级）；clientRequestId 并发同 id 只派发一次且两请求同 taskId、失败不缓存 | r3-37 #3、r3-39 #1/#2/#3/#4 |
+| AC-009 | 评审轮补充测试：create 部分失败（sendPrompt reject）仍 201 带 warning 且 taskId 可用；订阅建立失败不影响 201；auto/queue 受理后 buffer 即有 input.queued；waiting_input 五态分支；mode 非法 400；clientRequestId 命中返回同 taskId 不再派发；Host 退出结清在飞请求；终态后流订阅释放；op 异常出站固定文案 + 日志留痕 | FR-005/FR-013/FR-016 及评审项 |
+| AC-010 | 第三轮补充测试：长轮询唤醒只含 after 之后的新事件；懒重建后 after>0 回 `{resync:true}`、after=0 得空事件；rename 失败 201 带 `rename_failed`（与 first_prompt_failed 优先级）；clientRequestId 并发同 id 只派发一次且两请求同 taskId、失败不缓存。第五轮补充：CLI 真实形状下 `input.steered.commandId === 202 应答 commandId`（inputId 关联）；空闲任务 steer 应答 sent；messages clientRequestId 同 create 语义（命中回首次应答、in-flight 共享、失败不缓存） | r3-37 #3、r3-39 #1/#2/#3/#4 |
 
 **覆盖自查**：FR-001→AC-002；FR-002→AC-002；FR-003→AC-002；FR-004→AC-002；FR-005→AC-003/AC-009；FR-006→AC-003/AC-010；FR-007→AC-003；FR-008→AC-003；FR-009→AC-003/AC-010；FR-010→AC-003；FR-011→AC-004；FR-012→AC-003；FR-013→AC-007/AC-009；FR-014→AC-005；FR-015→AC-008；FR-016→AC-009/AC-010。
 
@@ -277,7 +279,7 @@ authority_refs:
 | 6 | workspaceIdentity 非空（远端 workspace）→ 409 | v2 只做本地 workspace；路由表 workspaceKeys 只含本地 |
 | 7 | 检查顺序：Host 头(403) → Bearer(401) → Content-Type(415) → 大小(413)；路径级 404/405 在鉴权前返回；POST body 参数校验（400 bad_request）先于 taskId 归属判定（404） | DNS rebinding 防护先于鉴权；契约未定顺序 |
 | 8 | `input.queued`（auto/queue 受理）由 API 自产；`input.steered` 由 CLI `turn_steer_queued` 流事件投影（commandId=pendingInputId）；CLI 权威结果另投影 `steer.injected`（drained）/`steer.fellBack{error}`（discarded/rejected） | queue 无专属流事件、受理即事实；steer 有 CLI 权威事件则以事件为准 |
-| 9 | 事件字段形状：`turn.started{turnId}`、`assistant.message{text}`、`turn.completed{text}`、`turn.failed{error}`、`permission.requested{summary}`、`input.queued{commandId}`（auto/queue 受理自产）、`input.steered{commandId}`（CLI `turn_steer_queued` 投影）、`steer.injected{}`（`turn_steer_status` drained：已注入当前轮）、`steer.fellBack{error}`（discarded/rejected：引导降级/被拒）；seq 每 task 从 1 单调（终态释放后懒重建从 1 重计，`after>0` 的旧水位返回 `{resync:true}`）；缓冲每任务 500 条、溢出 `{resync:true}`；长轮询唤醒按各客户端 `after` 过滤只发新事件；`task_error` 流事件与 failed 终态 1s 内去重只发一次；任务终态后 10 分钟整体释放订阅与缓冲（懒重建） | 契约正文未逐一点名字段名；去重防重复 failed；修剪防长驻进程累积 |
+| 9 | 事件字段形状：`turn.started{turnId}`、`assistant.message{text}`、`turn.completed{text}`、`turn.failed{error}`、`permission.requested{summary}`、`input.queued{commandId}`（auto/queue 受理自产）、`input.steered{commandId}`（CLI `turn_steer_queued` 投影，commandId=事件 inputId=envelope.commandId=202 应答 commandId；该类事件也可能来自 GUI 侧对同一任务的引导，消费方按 commandId 对账）、`steer.injected{}`（`turn_steer_status` drained：已注入当前轮）、`steer.fellBack{error}`（discarded/rejected：引导降级/被拒）；seq 每 task 从 1 单调（终态释放后懒重建从 1 重计，`after>0` 的旧水位返回 `{resync:true}`）；缓冲每任务 500 条、溢出 `{resync:true}`；长轮询唤醒按各客户端 `after` 过滤只发新事件；`task_error` 流事件与 failed 终态 1s 内去重只发一次；任务终态后 10 分钟整体释放订阅与缓冲（懒重建） | 契约正文未逐一点名字段名；去重防重复 failed；修剪防长驻进程累积 |
 | 10 | POST `/stop` 空 body 放行（无 Content-Type 也可）；`?workspacePath=`/body 空字符串视为未提供 | 传输层宽容语义已在文档写明 |
 | 11 | create 的 `mode` 经双层枚举白名单（对齐 `ZCodeTaskMode` 全集），非法值 400；上游文档列取值与权限含义（bypass 类档位会跳过权限闸门，含明确警示） | 评审拍板①；防 shared schema 拒绝导致的 300s 悬挂与免审批档位静默可达 |
 | 12 | create 接受可选 `clientRequestId`（1..200 字符）：Main 维护 10 分钟去重窗口，命中直接返回同一 `{taskId}` 不再派发 | 评审拍板②；create 有真实 agent 运行成本，HTTP 超时盲重试不应重复建任务 |

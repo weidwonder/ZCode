@@ -15,7 +15,7 @@
 |---|---|---|
 | webhook bot 入站回调处理（解析/鉴权/状态映射） | packages/server/src/http.ts#handleBotCallback（域卡 bots-webhook-callback） | webhook secret 不走 saveBot 的 credentialValue（存错 ref），必须用 webhookSecretValue；v1 曾抽 services 共享函数已回退 |
 | Main→Host 请求转发（requestId 模式） | packages/desktop/src/main/resourceManagerHostSampling.ts#requestHostResourceUsage（先例，域卡 desktop-host-ipc） | Main 进程内没有 IBotsService/IZCodeTaskService 实例，禁止 Main 直接 get；不要为此新建 RPC ChannelClient |
-| 本机任务 API（loopback HTTP→窗口 Host 任务服务） | packages/desktop/src/main/localTaskApi.ts + packages/desktop/src/host/localTaskApiResponder.ts（域卡 local-task-api） | GUI v4 建对话不走 IZCodeTaskService；steer 无原生原语只能 enqueue+promote 近似；running 判定只能用 listActiveTaskIds |
+| 本机任务 API（loopback HTTP→窗口 Host 任务服务） | packages/desktop/src/main/localTaskApi.ts + packages/desktop/src/host/localTaskApiResponder.ts（域卡 local-task-api） | GUI v4 建对话不走 IZCodeTaskService；enqueue+promote 不是即时引导（仅插队首），引导用 sendPrompt 带 requestedDelivery:"guide"（域卡 local-task-api）；running 判定只能用 listActiveTaskIds |
 | Bots 设置 provider 列表与凭据保存 | packages/ui/src/BotsDialog.tsx#saveBot（域卡 bots-ui） | per-provider i18n key 必须 zh-CN/en-US 成对，缺一个渲染 fallback |
 
 ## 能力表（完整形态）
