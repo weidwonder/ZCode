@@ -1319,4 +1319,269 @@ describe("localTaskApi", () => {
     expect(JSON.parse(tooLong.text)).toEqual({ error: "bad_request" });
     expect(captured).toHaveLength(0); // 两个 400 都未触达 Host
   });
+
+  it("create modelSelection：非法形状（空 providerId/多余键/空 reasoningLevel）→ 400 不 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    const emptyProviderId = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({
+        workspacePath: OPEN_WS,
+        prompt: "p",
+        modelSelection: { providerId: "", modelId: "m" },
+      }),
+    );
+    expect(emptyProviderId.status).toBe(400);
+    expect(JSON.parse(emptyProviderId.text)).toEqual({ error: "bad_request" });
+
+    const extraKey = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({
+        workspacePath: OPEN_WS,
+        prompt: "p",
+        modelSelection: { providerId: "p", modelId: "m", extra: 1 },
+      }),
+    );
+    expect(extraKey.status).toBe(400);
+
+    const emptyReasoning = await send(
+      { port, method: "POST", path: "/api/tasks", headers },
+      JSON.stringify({
+        workspacePath: OPEN_WS,
+        prompt: "p",
+        modelSelection: { providerId: "p", modelId: "m", options: { reasoningLevel: "" } },
+      }),
+    );
+    expect(emptyReasoning.status).toBe(400);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(captured).toHaveLength(0); // 三个 400 都未触达 Host
+  });
+
+  it("create modelSelection：合法值原样透传进 create op", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const modelSelection = {
+      providerId: "glm",
+      modelId: "glm-4.7",
+      options: { reasoningLevel: "high" },
+    };
+
+    const pending = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: OPEN_WS, prompt: "hi", modelSelection }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({
+      kind: "create",
+      workspacePath: OPEN_WS,
+      prompt: "hi",
+      modelSelection,
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t9" },
+    });
+    expect((await pending).status).toBe(201);
+  });
+
+  it("GET /api/models 鉴权与参数：Host 头非法 → 403；错 Bearer → 401；缺或空 workspacePath → 400", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const badHost = await send({
+      port,
+      path: `/api/models?workspacePath=${encodeURIComponent(OPEN_WS)}`,
+      headers: { host: "evil.example.com", authorization: BEARER },
+    });
+    expect(badHost.status).toBe(403);
+    expect(JSON.parse(badHost.text)).toEqual({ error: "host_header_forbidden" });
+
+    const badAuth = await send({
+      port,
+      path: `/api/models?workspacePath=${encodeURIComponent(OPEN_WS)}`,
+      headers: { authorization: "Bearer wrong" },
+    });
+    expect(badAuth.status).toBe(401);
+    expect(JSON.parse(badAuth.text)).toEqual({ error: "unauthorized" });
+
+    const missingWorkspace = await send({
+      port,
+      path: "/api/models",
+      headers: { authorization: BEARER },
+    });
+    expect(missingWorkspace.status).toBe(400);
+
+    const emptyWorkspace = await send({
+      port,
+      path: "/api/models?workspacePath=",
+      headers: { authorization: BEARER },
+    });
+    expect(emptyWorkspace.status).toBe(400);
+    expect(JSON.parse(emptyWorkspace.text)).toEqual({ error: "bad_request" });
+    expect(captured).toHaveLength(0); // 四个拒绝都未触达 Host
+  });
+
+  it("GET /api/models → listModels op 原样透传，应答回流 200", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const pending = send({
+      port,
+      path: `/api/models?workspacePath=${encodeURIComponent(OPEN_WS)}`,
+      headers: { authorization: BEARER },
+    });
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({ kind: "listModels", workspacePath: OPEN_WS });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { providers: [] },
+    });
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text)).toEqual({ providers: [] });
+  });
+
+  it("GET /api/models：workspace 无 Host → 409 workspace_not_open", async () => {
+    const { port } = await startServer();
+    const res = await send({
+      port,
+      path: `/api/models?workspacePath=${encodeURIComponent("/ws/closed")}`,
+      headers: { authorization: BEARER },
+    });
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_not_open" });
+  });
+
+  it("POST /:id/model 校验：缺 modelSelection / 缺 modelId / clientRequestId 超长 → 400 先于归属判定", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    const missing = await send(
+      { port, method: "POST", path: "/api/tasks/task-x/model", headers },
+      JSON.stringify({ workspacePath: OPEN_WS }),
+    );
+    expect(missing.status).toBe(400);
+    expect(JSON.parse(missing.text)).toEqual({ error: "bad_request" });
+
+    const noModelId = await send(
+      { port, method: "POST", path: "/api/tasks/task-x/model", headers },
+      JSON.stringify({ modelSelection: { providerId: "p" } }),
+    );
+    expect(noModelId.status).toBe(400);
+
+    const tooLongId = await send(
+      { port, method: "POST", path: "/api/tasks/task-x/model", headers },
+      JSON.stringify({
+        modelSelection: { providerId: "p", modelId: "m" },
+        clientRequestId: "x".repeat(201),
+      }),
+    );
+    expect(tooLongId.status).toBe(400);
+    expect(captured).toHaveLength(0); // 三个 400 都未触达 Host
+  });
+
+  it("POST /:id/model：归属表未命中且未带 workspacePath → 404 不 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks/task-x/model",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ modelSelection: { providerId: "glm", modelId: "glm-4.7" } }),
+    );
+    expect(res.status).toBe(404);
+    expect(JSON.parse(res.text)).toEqual({ error: "task_not_found" });
+    expect(captured).toHaveLength(0);
+  });
+
+  it("POST /:id/model：带 workspacePath 重锚定透传 setModel op；同 clientRequestId 幂等代答", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/ws/other"], captured),
+    });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      modelSelection: { providerId: "glm", modelId: "glm-4.7" },
+      workspacePath: "/ws/other",
+      clientRequestId: "mid-1",
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks/task-x/model", headers }, body);
+    await waitForCaptured(captured, 1);
+    expect(captured[0].op).toEqual({
+      kind: "setModel",
+      workspacePath: "/ws/other",
+      taskId: "task-x",
+      modelSelection: { providerId: "glm", modelId: "glm-4.7" },
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
+    const firstRes = await first;
+    expect(firstRes.status).toBe(200);
+    expect(JSON.parse(firstRes.text)).toEqual({ ok: true });
+
+    // 同 taskId 同 clientRequestId 重发：命中幂等表回首次应答，不再 dispatch。
+    const second = await send(
+      { port, method: "POST", path: "/api/tasks/task-x/model", headers },
+      body,
+    );
+    expect(second.status).toBe(200);
+    expect(JSON.parse(second.text)).toEqual({ ok: true });
+    expect(captured).toHaveLength(1);
+  });
+
+  it("POST /:id/model clientRequestId 失败不缓存：同 id 重发重新 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor([OPEN_WS, "/ws/other"], captured),
+    });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      modelSelection: { providerId: "glm", modelId: "glm-4.7" },
+      workspacePath: "/ws/other",
+      clientRequestId: "mid-fail",
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks/task-x/model", headers }, body);
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect((await first).status).toBe(503);
+
+    // 失败未缓存：同 id 重发重新 dispatch（captured 增为 2）而不是回旧应答。
+    const second = send({ port, method: "POST", path: "/api/tasks/task-x/model", headers }, body);
+    await waitForCaptured(captured, 2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
+    expect((await second).status).toBe(200);
+  });
 });

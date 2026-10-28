@@ -996,6 +996,7 @@ export const localTaskApiRequestOpSchema = z.discriminatedUnion("kind", [
       prompt: z.string(),
       mode: localTaskApiTaskModeSchema.optional(),
       title: z.string().optional(),
+      modelSelection: modelSelectionSchema.optional(),
     })
     .strict(),
   z
@@ -1033,6 +1034,20 @@ export const localTaskApiRequestOpSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("list"),
+      workspacePath: nonEmptyStringSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("setModel"),
+      workspacePath: nonEmptyStringSchema,
+      taskId: nonEmptyStringSchema,
+      modelSelection: modelSelectionSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("listModels"),
       workspacePath: nonEmptyStringSchema,
     })
     .strict(),

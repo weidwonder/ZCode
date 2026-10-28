@@ -4,7 +4,8 @@
  * 日志文案由本模块逐字保持；HTTP 写回经调用方注入的 respond 回调完成，本模块
  * 不接触传输。时序约定：claim 同步完成惰性清理 + 查表 + 未命中登记（miss 与
  * 登记之间无 await，并发同 id 不可能双双 dispatch），命中方经 respondToDuplicate
- * 异步等待共享应答。 */
+ * 异步等待共享应答。model 命名空间供 POST /api/tasks/:id/model 换模型幂等使用，
+ * key 加 `model\0` 前缀与 send 隔离（同一 clientRequestId 先后用于两个端点不会误判）。 */
 
 /** 与 dispatcher 应答同形的最小结构：幂等表缓存与共享 future 都用它。 */
 export type LocalTaskApiResponseLike = { status: number; body: unknown };
@@ -73,9 +74,17 @@ export interface ClientRequestIdDedup {
       claim: Exclude<SendDedupClaim, { kind: "fresh" }>,
     ): Promise<LocalTaskApiResponseLike>;
   };
+  model: {
+    /** 同 send：键加 `model\0` 前缀与 send 隔离，按任务隔离。 */
+    claim(taskId: string, clientRequestId: string): SendDedupClaim;
+    /** 命中代答：in-flight 等共享应答、done 回缓存，先输出 duplicate model 日志再返回应答。 */
+    respondToDuplicate(
+      claim: Exclude<SendDedupClaim, { kind: "fresh" }>,
+    ): Promise<LocalTaskApiResponseLike>;
+  };
 }
 
-/** 创建 clientRequestId 幂等：create 与 send 两个命名空间各自独立。 */
+/** 创建 clientRequestId 幂等：create / send / model 三个命名空间各自独立。 */
 export function createClientRequestIdDedup(
   options: ClientRequestIdDedupOptions,
 ): ClientRequestIdDedup {
@@ -83,7 +92,8 @@ export function createClientRequestIdDedup(
   const now = options.now ?? Date.now;
   return {
     create: createCreateNamespace(options.logger, ttlMs, now),
-    send: createSendNamespace(options.logger, ttlMs, now),
+    send: createSendNamespace(options.logger, ttlMs, now, "", "send"),
+    model: createSendNamespace(options.logger, ttlMs, now, "model\0", "model"),
   };
 }
 
@@ -159,11 +169,13 @@ function createSendNamespace(
   logger: ClientRequestIdDedupOptions["logger"],
   ttlMs: number,
   now: () => number,
+  keyPrefix: string,
+  logLabel: string,
 ) {
   const entries = new Map<string, DedupEntry<LocalTaskApiResponseLike>>();
 
   function claim(taskId: string, clientRequestId: string): SendDedupClaim {
-    const dedupeKey = `${taskId}\0${clientRequestId}`;
+    const dedupeKey = `${keyPrefix}${taskId}\0${clientRequestId}`;
     const nowMs = now();
     // 惰性清理：与 create 同语义，dispatch 之前先删过期项。
     for (const [key, entry] of entries) {
@@ -206,7 +218,7 @@ function createSendNamespace(
     const shared = claim.kind === "inflight" ? await claim.future : claim.response;
     // 等待方直接透传首个请求的应答：归属表由首个请求回填，这里不重复回填。
     logger.info(
-      `[local-task-api] duplicate send request=${claim.clientRequestId} task=${claim.taskId}`,
+      `[local-task-api] duplicate ${logLabel} request=${claim.clientRequestId} task=${claim.taskId}`,
     );
     return shared;
   }

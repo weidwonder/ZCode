@@ -7,12 +7,32 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAppConfigDir } from "@zcode/services/node";
-import { HostMessageTypes, localTaskApiTaskModes, type LocalTaskApiRequestOp } from "@zcode/shared";
+import {
+  HostMessageTypes,
+  localTaskApiTaskModes,
+  modelSelectionSchema,
+  type LocalTaskApiRequestOp,
+  type ModelSelection,
+} from "@zcode/shared";
 import { createClientRequestIdDedup, taskIdOf } from "./localTaskApiClientRequestId.js";
+import {
+  hasDeclaredBody,
+  isRecord,
+  parseAfter,
+  parsePathSegments,
+  parseWaitMs,
+  readRequestBody,
+  segmentAt,
+  sendJson,
+  validateClientRequestId,
+} from "./localTaskApiHttpUtil.js";
+import {
+  handleGetModelsRoute,
+  handleSetModelRoute,
+  type LocalTaskApiModelRouteDeps,
+} from "./localTaskApiModelRoutes.js";
 
 export const LOCAL_TASK_API_CONFIG_FILE = "local-task-api.json";
-/** POST body 上限：16 MiB，超出回 413。 */
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
 /** 开关文件 token 最短长度。 */
 const MIN_TOKEN_CHARS = 32;
 /** dispatcher 兜底超时（events 的 waitMs 上限 30s 远小于此）。 */
@@ -248,78 +268,6 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     return normalized === `127.0.0.1:${port}` || normalized === `localhost:${port}`;
   }
 
-  function sendJson(res: ServerResponse, status: number, body: unknown): void {
-    res.writeHead(status, { "content-type": "application/json" });
-    res.end(JSON.stringify(body));
-  }
-
-  type BodyReadResult = { ok: true; text: string } | { ok: false; tooLarge: boolean };
-
-  function readRequestBody(req: IncomingMessage): Promise<BodyReadResult> {
-    return new Promise((resolve) => {
-      const chunks: Buffer[] = [];
-      let total = 0;
-      let settled = false;
-      const finish = (result: BodyReadResult) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-      req.on("data", (chunk: Buffer) => {
-        if (settled) return;
-        total += chunk.length;
-        if (total > MAX_BODY_BYTES) {
-          finish({ ok: false, tooLarge: true });
-          return;
-        }
-        chunks.push(chunk);
-      });
-      req.on("end", () => finish({ ok: true, text: Buffer.concat(chunks).toString("utf8") }));
-      req.on("error", () => finish({ ok: false, tooLarge: false }));
-    });
-  }
-
-  function hasDeclaredBody(req: IncomingMessage): boolean {
-    const contentLength = req.headers["content-length"];
-    if (contentLength !== undefined && Number(contentLength) > 0) return true;
-    return req.headers["transfer-encoding"] !== undefined;
-  }
-
-  function parseAfter(raw: string | null): number {
-    if (raw === null || raw === "") return 0;
-    const parsed = Number(raw);
-    if (!Number.isInteger(parsed) || parsed < 0) return 0;
-    return parsed;
-  }
-
-  function parseWaitMs(raw: string | null): number {
-    const parsed = Number(raw ?? "0");
-    const base = Number.isFinite(parsed) ? parsed : 0;
-    return Math.min(30_000, Math.max(0, Math.trunc(base)));
-  }
-
-  function parsePathSegments(pathname: string): string[] | null {
-    const segments: string[] = [];
-    for (const segment of pathname.split("/")) {
-      if (segment.length === 0) continue;
-      try {
-        segments.push(decodeURIComponent(segment));
-      } catch {
-        return null;
-      }
-    }
-    return segments;
-  }
-
-  function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null;
-  }
-
-  function segmentAt(segments: string[], index: number): string | null {
-    const value = segments[index];
-    return typeof value === "string" && value.length > 0 ? value : null;
-  }
-
   function resolveTaskWorkspace(
     res: ServerResponse,
     taskId: string,
@@ -360,6 +308,19 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     }
   }
 
+  // 模型两条路由（GET /api/models、POST /api/tasks/:id/model）的依赖注入，
+  // 实现在 localTaskApiModelRoutes.ts（拆出以守 800 行 lint 上限）。
+  const modelRouteDeps: LocalTaskApiModelRouteDeps = {
+    isAllowedHostHeader,
+    isAuthorized,
+    noteReject,
+    dispatchOp,
+    dispatcher,
+    clientRequestIdDedup,
+    resolveTaskWorkspace,
+    taskWorkspaceByTaskId,
+  };
+
   async function handleGet(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const pathname = url.pathname;
     if (pathname === "/health") {
@@ -376,6 +337,11 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
     const segments = parsePathSegments(pathname);
     if (segments === null) {
       sendJson(res, 400, { error: "bad_request" });
+      return;
+    }
+
+    if (segments.length === 2 && segments[0] === "api" && segments[1] === "models") {
+      await handleGetModelsRoute(req, res, url, modelRouteDeps);
       return;
     }
 
@@ -484,7 +450,12 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       segments[0] === "api" &&
       segments[1] === "tasks" &&
       segments[3] === "stop";
-    if (!isCreate && !isSend && !isStop) {
+    const isSetModel =
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "tasks" &&
+      segments[3] === "model";
+    if (!isCreate && !isSend && !isStop && !isSetModel) {
       sendJson(res, 404, { error: "not_found" });
       return;
     }
@@ -540,7 +511,7 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
       const prompt = parsed["prompt"];
       const mode = parsed["mode"];
       const title = parsed["title"];
-      const clientRequestId = parsed["clientRequestId"];
+      const modelSelection = parsed["modelSelection"];
       if (
         typeof workspacePath !== "string" ||
         workspacePath.length === 0 ||
@@ -553,21 +524,25 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         sendJson(res, 400, { error: "bad_request" });
         return;
       }
-      let normalizedClientRequestId: string | null = null;
-      if (clientRequestId !== undefined) {
-        if (
-          typeof clientRequestId !== "string" ||
-          clientRequestId.length < 1 ||
-          clientRequestId.length > 200
-        ) {
+      // modelSelection 若存在必须过 shared strict schema：strict 拒绝发生在 Host 侧且不应答，
+      // 请求只能等 300s 兜底悬挂，所以 Main 先 400（与 mode 同理由）。
+      let parsedModelSelection: ModelSelection | undefined;
+      if (modelSelection !== undefined) {
+        const safeModelSelection = modelSelectionSchema.safeParse(modelSelection);
+        if (!safeModelSelection.success) {
           sendJson(res, 400, { error: "bad_request" });
           return;
         }
-        normalizedClientRequestId = clientRequestId;
+        parsedModelSelection = safeModelSelection.data;
+      }
+      const clientRequestIdState = validateClientRequestId(parsed);
+      if (clientRequestIdState === "invalid") {
+        sendJson(res, 400, { error: "bad_request" });
+        return;
       }
       // clientRequestId 幂等：claim 同步完成惰性清理、查表与未命中登记；命中由 respondToDuplicate 代答、
       // 不再 dispatch；dispatch 结束必须 settle（createClaim.settle）：成功落缓存、失败清除（逻辑见 .ts）。
-      const createClaim = clientRequestIdDedup.create.claim(normalizedClientRequestId);
+      const createClaim = clientRequestIdDedup.create.claim(clientRequestIdState);
       if (createClaim.kind !== "fresh") {
         const duplicate = await clientRequestIdDedup.create.respondToDuplicate(createClaim);
         sendJson(res, duplicate.status, duplicate.body);
@@ -581,6 +556,7 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
           ? { mode: mode as (typeof localTaskApiTaskModes)[number] }
           : {}),
         ...(typeof title === "string" ? { title } : {}),
+        ...(parsedModelSelection !== undefined ? { modelSelection: parsedModelSelection } : {}),
       };
       try {
         const result = await dispatcher.dispatch(workspacePath, op);
@@ -642,6 +618,11 @@ export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server
         { kind: "stop", workspacePath, taskId },
         wasOwned ? undefined : { rememberTask: { taskId, workspacePath } },
       );
+      return;
+    }
+
+    if (isSetModel) {
+      await handleSetModelRoute(res, taskId, body.text, modelRouteDeps);
       return;
     }
 

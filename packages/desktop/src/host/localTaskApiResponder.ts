@@ -1,8 +1,8 @@
 /* 本机任务 API 的 Host 侧应答器：Main 按 workspace 路由转发过来的请求在这里
- * 调用本 Host 的 IZCodeTaskService。六个 op 的业务语义、事件 ring buffer 与
+ * 调用本 Host 的 IZCodeTaskService。九个 op 的业务语义、事件 ring buffer 与
  * 长轮询都收敛在本文件；Main 只做传输与鉴权，不承载任务业务状态。 */
 import { randomUUID } from "node:crypto";
-import { IZCodeTaskService, type ServiceCollection } from "@zcode/services";
+import { IModelSelectionService, IZCodeTaskService, type ServiceCollection } from "@zcode/services";
 import type {
   HostLocalTaskApiRequestMessage,
   HostLocalTaskApiResponseMessage,
@@ -19,6 +19,7 @@ export type LocalTaskApiTaskService = Pick<
   | "listTasks"
   | "listActiveTaskIds"
   | "renameTask"
+  | "setModel"
   | "onDynamicTaskEvent"
   | "onDynamicTaskTerminalOutcome"
 >;
@@ -231,6 +232,7 @@ export function createLocalTaskApiResponder(deps: {
 
   async function dispatch(
     taskService: LocalTaskApiTaskService,
+    modelSelectionService: Pick<IModelSelectionService, "getView"> | null,
     op: HostLocalTaskApiRequestMessage["op"],
   ): Promise<{ status: number; body: unknown }> {
     if (op.kind === "create") {
@@ -238,6 +240,8 @@ export function createLocalTaskApiResponder(deps: {
         workspacePath: op.workspacePath,
         deferPersistenceUntilFirstPrompt: true,
         ...(op.mode ? { mode: op.mode } : {}),
+        // modelSelection 直接透传（IZCodeTaskService.createTask 正式字段；deprecated 的 model/thoughtLevel 不用）。
+        ...(op.modelSelection ? { modelSelection: op.modelSelection } : {}),
       });
       // 订阅先行：首条 prompt 与 rename 的结果事件都要能进 buffer；失败不回滚 create，
       // 后续首次 events 调用会懒订阅兜底。
@@ -417,6 +421,47 @@ export function createLocalTaskApiResponder(deps: {
       return { status: 200, body: result };
     }
 
+    if (op.kind === "listModels") {
+      // 模型候选与 GUI 新建对话同源：IModelSelectionService.getView() 的 providers[].models[]
+      // （GUI 分组展示见 ui/src/lib/modelSelectionGroups.ts#buildRegistryModelSelectGroups，模型
+      // 显示名即 modelId）；思考档位读模型 config.optionSpecs.reasoningLevel.values（GUI 投影
+      // 先例 ui/src/lib/modelThoughtOption.ts#resolveModelThoughtOption，缺失/空 → 该模型无
+      // 档位）；默认选择透传 view.preferredSelection（automation 先例
+      // host/automationModelSelection.ts）。不做 GUI 的 selectedProvider 菜单过滤——
+      // view.providers 本身就是 Environment Registry 的执行目录。
+      if (!modelSelectionService) return { status: 503, body: { error: "unavailable_host" } };
+      const view = await modelSelectionService.getView();
+      const preferred = view.preferredSelection;
+      return {
+        status: 200,
+        body: {
+          providers: view.providers.map((provider) => ({
+            providerId: provider.providerId,
+            displayName: provider.providerName?.trim() || provider.providerId,
+            models: provider.models.map((model) => ({
+              modelId: model.modelId,
+              displayName: model.modelId,
+              // optionSpecs 类型上必有（completeModelConfigDataSchema），可选链是配置解析缺口的防御。
+              thoughtLevels: model.config.optionSpecs?.reasoningLevel?.values ?? [],
+              isDefault:
+                preferred?.providerId === provider.providerId && preferred?.modelId === model.modelId,
+            })),
+          })),
+          ...(preferred ? { preferred } : {}),
+        },
+      };
+    }
+
+    if (op.kind === "setModel") {
+      // 归属校验：与 send/stop/events 同一模式（重锚定语义）。
+      const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
+      if (!meta) return { status: 404, body: { error: "task_not_found" } };
+      // 运行中允许换模型——与 GUI 一致（GUI 仅 Highspeed 卡激活时锁定，SessionPane.tsx 的
+      // handleSelectModel；Highspeed 是 UI 运行态，Host 侧不可见，agent 侧拒绝时经外层 503 表现）。
+      await taskService.setModel({ taskId: op.taskId, traceId: newUUID(), modelSelection: op.modelSelection });
+      return { status: 200, body: { ok: true } };
+    }
+
     // op.kind === "list"
     const tasks = await taskService.listTasks({ workspacePath: op.workspacePath });
     const activeIds = new Set(await taskService.listActiveTaskIds({ workspacePath: op.workspacePath }));
@@ -441,8 +486,9 @@ export function createLocalTaskApiResponder(deps: {
         reply(msg.requestId, true, 503, { error: "unavailable_host" });
         return;
       }
+      const modelSelectionService = services?.getOptional(IModelSelectionService) ?? null;
       try {
-        const { status, body } = await dispatch(taskService, msg.op);
+        const { status, body } = await dispatch(taskService, modelSelectionService, msg.op);
         reply(msg.requestId, true, status, body);
       } catch (error) {
         // 出站只带固定文案，不外泄内部错误文本；原始错误经 log 输出一行。

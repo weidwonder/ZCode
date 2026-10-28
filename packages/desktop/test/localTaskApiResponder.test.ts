@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { IZCodeTaskService, ServiceCollection } from "@zcode/services";
+import { IModelSelectionService, IZCodeTaskService, ServiceCollection } from "@zcode/services";
 import type { HostLocalTaskApiRequestMessage, HostLocalTaskApiResponseMessage } from "@zcode/shared";
 import { createLocalTaskApiResponder } from "../src/host/localTaskApiResponder.js";
 
@@ -15,8 +15,10 @@ interface Harness {
   log: ReturnType<typeof vi.fn>;
 }
 
-/** ServiceCollection + 10 个 Pick 面方法全量 mock；post 收集到数组。 */
-function createHarness(overrides: Record<string, unknown> = {}): Harness {
+/** ServiceCollection + 11 个 Pick 面方法全量 mock；post 收集到数组。
+ * modelSelectionView 非 undefined 时额外注册 IModelSelectionService（listModels op 用；
+ * 缺省不注册 → listModels 走 503 分支，其余 op 不受影响）。 */
+function createHarness(overrides: Record<string, unknown> = {}, modelSelectionView?: unknown): Harness {
   const eventListeners: Array<(event: unknown) => void> = [];
   const terminalListeners: Array<(outcome: unknown) => void> = [];
   const mock: Record<string, ReturnType<typeof vi.fn>> = {
@@ -37,6 +39,8 @@ function createHarness(overrides: Record<string, unknown> = {}): Harness {
     listTasks: vi.fn(async () => []),
     listActiveTaskIds: vi.fn(async () => [] as string[]),
     renameTask: vi.fn(async () => null),
+    // setModel op（POST /:id/model 落到 Host 的换模型）：应答不消费其返回值。
+    setModel: vi.fn(async () => []),
     // 真实签名：onDynamicTaskEvent(params) → Event<T>，再以 listener 调用才得到 IDisposable。
     onDynamicTaskEvent: vi.fn((_params: unknown) => {
       return (listener: (event: unknown) => void) => {
@@ -54,6 +58,12 @@ function createHarness(overrides: Record<string, unknown> = {}): Harness {
   };
   const services = new ServiceCollection();
   services.register(IZCodeTaskService, mock as unknown as IZCodeTaskService);
+  if (modelSelectionView !== undefined) {
+    services.register(
+      IModelSelectionService,
+      { getView: vi.fn(async () => modelSelectionView) } as never,
+    );
+  }
   const posted: HostLocalTaskApiResponseMessage[] = [];
   const log = vi.fn();
   const responder = createLocalTaskApiResponder({
@@ -810,5 +820,170 @@ describe("localTaskApiResponder", () => {
       status: 201,
       body: { taskId: TASK_ID, warning: "first_prompt_failed" },
     });
+  });
+
+  it("create：modelSelection 透传进 createTask（与 deferPersistence 并存）", async () => {
+    const { responder, posted, mock } = createHarness();
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "glm", modelId: "glm-4.7" },
+      }),
+    );
+
+    expect(mock.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspacePath: WORKSPACE,
+        deferPersistenceUntilFirstPrompt: true,
+        modelSelection: { providerId: "glm", modelId: "glm-4.7" },
+      }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
+  });
+
+  it("listModels：getView() 投影 providers/models（displayName 回落、thoughtLevels 缺省空、isDefault 按 preferred）", async () => {
+    // 形状对齐 ModelSelectionView：providerName 可缺省；config.optionSpecs 按
+    // RegistryModelConfigObject 恒存在（reasoningLevel 才可缺省）。
+    const view = {
+      revision: 1,
+      providers: [
+        {
+          providerId: "glm",
+          providerName: "智谱 GLM",
+          config: {},
+          models: [
+            {
+              modelId: "glm-4.7",
+              config: { optionSpecs: { reasoningLevel: { values: ["low", "high"] } } },
+            },
+            { modelId: "glm-4.7-air", config: { optionSpecs: {} } },
+          ],
+        },
+        {
+          providerId: "bare",
+          config: {},
+          models: [{ modelId: "m1", config: { optionSpecs: {} } }],
+        },
+      ],
+      preferredSelection: { providerId: "glm", modelId: "glm-4.7", options: { reasoningLevel: "high" } },
+    };
+    const { responder, posted } = createHarness({}, view);
+
+    await responder.handleRequest(request("r2", { kind: "listModels", workspacePath: WORKSPACE }));
+
+    expect(posted.at(-1)).toEqual({
+      type: "local-task-api-response",
+      requestId: "r2",
+      ok: true,
+      status: 200,
+      body: {
+        providers: [
+          {
+            providerId: "glm",
+            displayName: "智谱 GLM",
+            models: [
+              {
+                modelId: "glm-4.7",
+                displayName: "glm-4.7",
+                thoughtLevels: ["low", "high"],
+                isDefault: true,
+              },
+              {
+                modelId: "glm-4.7-air",
+                displayName: "glm-4.7-air",
+                thoughtLevels: [],
+                isDefault: false,
+              },
+            ],
+          },
+          {
+            providerId: "bare",
+            displayName: "bare", // providerName 缺省回落 providerId
+            models: [{ modelId: "m1", displayName: "m1", thoughtLevels: [], isDefault: false }],
+          },
+        ],
+        preferred: { providerId: "glm", modelId: "glm-4.7", options: { reasoningLevel: "high" } },
+      },
+    });
+  });
+
+  it("listModels：IModelSelectionService 未注册 → 503 unavailable_host", async () => {
+    const { responder, posted } = createHarness(); // 缺省不注册模型服务
+
+    await responder.handleRequest(request("r1", { kind: "listModels", workspacePath: WORKSPACE }));
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+  });
+
+  it("setModel：getTaskMeta 查不到 → 404 前置，不触达 setModel", async () => {
+    const { responder, posted, mock } = createHarness({
+      getTaskMeta: vi.fn(async () => null),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "setModel",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(mock.getTaskMeta).toHaveBeenCalledWith({ taskId: TASK_ID, workspacePath: WORKSPACE });
+    expect(mock.setModel).not.toHaveBeenCalled();
+    expect(posted.at(-1)).toMatchObject({ status: 404, body: { error: "task_not_found" } });
+  });
+
+  it("setModel：meta 命中 → setModel 以 uuid traceId 调用，应答 200 {ok:true}", async () => {
+    const { responder, posted, mock } = createHarness();
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "setModel",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(mock.setModel).toHaveBeenCalledWith({
+      taskId: TASK_ID,
+      traceId: expect.stringMatching(UUID_RE),
+      modelSelection: { providerId: "p", modelId: "m" },
+    });
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 200, body: { ok: true } });
+  });
+
+  it("setModel：setModel 抛错 → 503 固定文案，原始错误只进 log 一行", async () => {
+    const { responder, posted, log } = createHarness({
+      setModel: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "setModel",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect(JSON.stringify(posted.at(-1)!.body)).not.toContain("boom");
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("boom"));
   });
 });
