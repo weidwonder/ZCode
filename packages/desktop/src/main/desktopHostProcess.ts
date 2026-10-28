@@ -55,6 +55,10 @@ import { ingestCliResourceSample } from "./processResourceCliSource.js";
 import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
 import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
 import {
+  resolveLocalTaskApiResponse,
+  settleLocalTaskApiRequestsForHost,
+} from "./localTaskApi.js";
+import {
   registerHostAgentProcess,
   registerHostProcess,
   unregisterHostAgentProcess,
@@ -338,6 +342,11 @@ export function spawnHostProcess(
 
     if (result.data.type === HostResponseTypes.ResourceUsageSnapshotResult) {
       resolveHostResourceUsageResult(label, result.data);
+      return;
+    }
+
+    if (result.data.type === HostResponseTypes.LocalTaskApiResponse) {
+      resolveLocalTaskApiResponse(result.data);
       return;
     }
 
@@ -646,6 +655,8 @@ export function spawnHostProcess(
 
   child.on("exit", (code) => {
     exitedHostProcesses.add(child);
+    // Host 退出时立即结清本机任务 API 的在飞请求（含 events 长轮询），不等 300s 兜底。
+    settleLocalTaskApiRequestsForHost(child);
     // Host exit 是 fail-hidden 权威边界；不能依赖即将退出的 Host 再补发 inactive。
     dependencies.onCuaOperationStateSourceExited?.(child);
     hostLogRelay.flushRawLogs();
