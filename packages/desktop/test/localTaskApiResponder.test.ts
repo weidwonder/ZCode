@@ -15,7 +15,7 @@ interface Harness {
   log: ReturnType<typeof vi.fn>;
 }
 
-/** ServiceCollection + 12 个 Pick 面方法全量 mock；post 收集到数组。 */
+/** ServiceCollection + 10 个 Pick 面方法全量 mock；post 收集到数组。 */
 function createHarness(overrides: Record<string, unknown> = {}): Harness {
   const eventListeners: Array<(event: unknown) => void> = [];
   const terminalListeners: Array<(outcome: unknown) => void> = [];
@@ -30,8 +30,6 @@ function createHarness(overrides: Record<string, unknown> = {}): Harness {
       mode: "code",
     })),
     sendPrompt: vi.fn(async () => undefined),
-    enqueueTaskCommand: vi.fn(async () => ({ commandId: "cmd-1" })),
-    promoteTaskCommand: vi.fn(async () => ({ commandId: "cmd-1" })),
     stopGeneration: vi.fn(async () => undefined),
     getTaskSnapshot: vi.fn(async () => null),
     // send/stop/events op 现在先过归属校验：默认放行（meta 存在），否则三个 op 全 404。
@@ -108,8 +106,8 @@ describe("localTaskApiResponder", () => {
     expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
   });
 
-  it("create：带 title 走 renameTask，带 mode 透传给 createTask", async () => {
-    const { responder, mock } = createHarness();
+  it("create：带 title 走 renameTask，且 rename 在首条 sendPrompt 成功之后（defer 落盘依赖）", async () => {
+    const { responder, posted, mock } = createHarness();
 
     await responder.handleRequest(
       request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T", mode: "plan" }),
@@ -121,6 +119,14 @@ describe("localTaskApiResponder", () => {
     expect(mock.createTask).toHaveBeenCalledWith(
       expect.objectContaining({ workspacePath: WORKSPACE, mode: "plan" }),
     );
+    // 顺序钉死：首条 sendPrompt（defer 模式下 session 随它落盘）必须先于 renameTask，
+    // 否则底层 renameSession 报 Session not found after write（真机日志）。
+    expect(mock.sendPrompt.mock.invocationCallOrder[0]!).toBeLessThan(
+      mock.renameTask.mock.invocationCallOrder[0]!,
+    );
+    // 两者都成功：无 warning。
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
+    expect((posted.at(-1)!.body as { warning?: string }).warning).toBeUndefined();
   });
 
   it("create：订阅两个动态事件，投影 task_run_started 后 events op 能读到 turn.started", async () => {
@@ -149,7 +155,7 @@ describe("localTaskApiResponder", () => {
     });
   });
 
-  it("send 空闲：直接 sendPrompt（traceId 为 uuid），应答 delivery=sent", async () => {
+  it("send auto：sendPrompt 不带 requestedDelivery（跟随会话 followupMode），应答 delivery=sent + commandId", async () => {
     const { responder, posted, mock } = createHarness();
 
     await responder.handleRequest(
@@ -159,52 +165,58 @@ describe("localTaskApiResponder", () => {
         taskId: TASK_ID,
         text: "hello",
         delivery: "auto",
+      }),
+    );
+
+    expect(mock.sendPrompt).toHaveBeenCalledTimes(1);
+    expect(mock.sendPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: TASK_ID, content: "hello", clientMode: "desktop-continuous" }),
+    );
+    const params = mock.sendPrompt.mock.calls[0]![0] as {
+      traceId: string;
+      requestedDelivery?: string;
+    };
+    expect(params.traceId).toMatch(UUID_RE);
+    expect(params.requestedDelivery).toBeUndefined();
+    const body = posted.at(-1)!.body as { delivery: string; commandId: string };
+    expect(body.delivery).toBe("sent");
+    expect(body.commandId).toMatch(UUID_RE);
+    // 受理也发 input.queued：GUI 运行中默认提交会被 CLI 排队或引导，对账方需要知道有输入进入。
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> }).events;
+    expect(events.at(-1)).toMatchObject({ type: "input.queued", commandId: body.commandId });
+  });
+
+  it("send queue：sendPrompt 带 requestedDelivery=queue，应答 delivery=queued + commandId", async () => {
+    const { responder, posted, mock } = createHarness();
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "queue",
       }),
     );
 
     expect(mock.sendPrompt).toHaveBeenCalledWith(
-      expect.objectContaining({ taskId: TASK_ID, content: "hello", clientMode: "desktop-continuous" }),
-    );
-    const traceId = (mock.sendPrompt.mock.calls[0]![0] as { traceId: string }).traceId;
-    expect(traceId).toMatch(UUID_RE);
-    expect(posted.at(-1)).toMatchObject({ ok: true, status: 202, body: { delivery: "sent" } });
-  });
-
-  it("send 运行中 auto：入队 command，应答 delivery=queued + commandId", async () => {
-    const { responder, posted, mock } = createHarness();
-    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
-
-    await responder.handleRequest(
-      request("r1", {
-        kind: "send",
-        workspacePath: WORKSPACE,
-        taskId: TASK_ID,
-        text: "hello",
-        delivery: "auto",
-      }),
-    );
-
-    expect(mock.enqueueTaskCommand).toHaveBeenCalledWith(
       expect.objectContaining({
-        workspacePath: WORKSPACE,
         taskId: TASK_ID,
-        type: "send_prompt",
         content: "hello",
+        clientMode: "desktop-continuous",
+        requestedDelivery: "queue",
       }),
     );
-    expect(mock.promoteTaskCommand).not.toHaveBeenCalled();
     const body = posted.at(-1)!.body as { delivery: string; commandId: string };
     expect(body.delivery).toBe("queued");
-    expect(body.commandId).toBeTruthy();
+    expect(body.commandId).toMatch(UUID_RE);
   });
 
-  it("send 运行中 steer：入队 + promote，应答 delivery=steered，events 里能查到 input.steered", async () => {
+  it("send steer：sendPrompt 带 requestedDelivery=guide，应答 delivery=steered，受理时无自产事件", async () => {
     const { responder, posted, mock } = createHarness();
-    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
-    // 先经 events op 懒订阅建 buffer；无 buffer 时 input.steered 按设计被忽略。
-    await responder.handleRequest(
-      request("r0", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
-    );
 
     await responder.handleRequest(
       request("r1", {
@@ -216,18 +228,55 @@ describe("localTaskApiResponder", () => {
       }),
     );
 
-    expect(mock.enqueueTaskCommand).toHaveBeenCalledTimes(1);
-    expect(mock.promoteTaskCommand).toHaveBeenCalledWith(
-      expect.objectContaining({ taskId: TASK_ID, clientMode: "desktop-continuous" }),
+    expect(mock.sendPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: TASK_ID,
+        content: "hello",
+        clientMode: "desktop-continuous",
+        requestedDelivery: "guide",
+      }),
     );
-    const commandId = (posted.at(-1)!.body as { delivery: string; commandId: string }).commandId;
-    expect(commandId).toBeTruthy();
+    const body = posted.at(-1)!.body as { delivery: string; commandId: string };
+    expect(body.delivery).toBe("steered");
+    expect(body.commandId).toMatch(UUID_RE);
 
     await responder.handleRequest(
       request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
     );
-    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> }).events;
-    expect(events.at(-1)).toMatchObject({ type: "input.steered", commandId });
+    const events = (posted.at(-1)!.body as { events: Array<{ type: string }> }).events;
+    // 受理不自产 input.steered：由 turn_steer_queued 流事件投影统一发出。
+    expect(events.some((event) => event.type === "input.steered")).toBe(false);
+  });
+
+  it("steer 权威投影：turn_steer_queued → input.steered(pendingInputId)；status drained/discarded → injected/fellBack", async () => {
+    const { responder, posted, eventListeners } = createHarness();
+    // send 受理即补订阅：listener 已就位，直接投递 CLI 流事件。
+    await responder.handleRequest(
+      request("r1", {
+        kind: "send",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        text: "hello",
+        delivery: "steer",
+      }),
+    );
+
+    eventListeners[0]!({ type: "turn_steer_queued", pendingInputId: "pi-1" });
+    eventListeners[0]!({ type: "turn_steer_status", status: "drained" });
+    eventListeners[0]!({ type: "turn_steer_status", status: "discarded", reason: "turn ended" });
+
+    await responder.handleRequest(
+      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
+    );
+    const events = (
+      posted.at(-1)!.body as { events: Array<{ type: string; commandId?: string; error?: string }> }
+    ).events;
+    expect(events.some((event) => event.type === "input.steered" && event.commandId === "pi-1")).toBe(
+      true,
+    );
+    expect(events.some((event) => event.type === "steer.injected")).toBe(true);
+    const fellBack = events.find((event) => event.type === "steer.fellBack");
+    expect(fellBack).toMatchObject({ type: "steer.fellBack", error: "turn ended" });
   });
 
   it("stop：stopGeneration 以 {taskId, workspacePath} 调用，应答 202", async () => {
@@ -366,7 +415,7 @@ describe("localTaskApiResponder", () => {
     });
   });
 
-  it("send：getTaskMeta 查不到任务 → 404 前置，不触达 sendPrompt/enqueue/listActive", async () => {
+  it("send：getTaskMeta 查不到任务 → 404 前置，不触达 sendPrompt/listActive", async () => {
     const { responder, posted, mock } = createHarness({
       getTaskMeta: vi.fn(async () => null),
     });
@@ -383,9 +432,8 @@ describe("localTaskApiResponder", () => {
 
     expect(mock.getTaskMeta).toHaveBeenCalledWith({ taskId: "task-other", workspacePath: WORKSPACE });
     expect(mock.sendPrompt).not.toHaveBeenCalled();
-    expect(mock.enqueueTaskCommand).not.toHaveBeenCalled();
     expect(mock.listActiveTaskIds).not.toHaveBeenCalled();
-    expect(posted.at(-1)).toMatchObject({ ok: true, status: 404, body: { error: "task_not_found" } });
+    expect(posted.at(-1)).toMatchObject({ status: 404, body: { error: "task_not_found" } });
   });
 
   it("stop/events：getTaskMeta null → 404 前置；meta 命中 → 正常走 stopGeneration 与 buffer", async () => {
@@ -481,9 +529,8 @@ describe("localTaskApiResponder", () => {
     expect(posted.at(-1)).toMatchObject({ status: 200, body: { status: "waiting_input" } });
   });
 
-  it("send 运行中 auto：受理即补订阅，随后 events 立即可查 input.queued", async () => {
+  it("send auto：受理即补订阅（onDynamicTaskEvent 挂上），随后 events 立即可查 input.queued", async () => {
     const { responder, posted, mock } = createHarness();
-    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
 
     await responder.handleRequest(
       request("r1", {
@@ -494,7 +541,8 @@ describe("localTaskApiResponder", () => {
         delivery: "auto",
       }),
     );
-    expect(posted.at(-1)).toMatchObject({ ok: true, status: 202, body: { delivery: "queued" } });
+    expect(mock.onDynamicTaskEvent).toHaveBeenCalledTimes(1);
+    expect(posted.at(-1)).toMatchObject({ status: 202, body: { delivery: "sent" } });
 
     await responder.handleRequest(
       request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
@@ -503,23 +551,24 @@ describe("localTaskApiResponder", () => {
     expect(events.some((event) => event.type === "input.queued")).toBe(true);
   });
 
-  it("create：首条 prompt 失败 → 仍 201 + warning=first_prompt_failed，taskId 与 createTask 返回一致", async () => {
+  it("create：首条 prompt 失败 → 仍 201 + warning=first_prompt_failed，且不再尝试 renameTask", async () => {
     const { responder, posted, mock, log } = createHarness();
     mock.sendPrompt.mockImplementation(async () => {
       throw new Error("prompt rejected");
     });
 
     await responder.handleRequest(
-      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi" }),
+      request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T" }),
     );
 
     expect(posted.at(-1)).toMatchObject({
-      ok: true,
       status: 201,
       body: { taskId: TASK_ID, warning: "first_prompt_failed" },
     });
     expect((posted.at(-1)!.body as { taskId: string }).taskId).toBe(TASK_ID);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("prompt rejected"));
+    // 首 prompt 已失败时 defer 模式的 session 仍可能未落盘：跳过 rename，避免再一次必然失败。
+    expect(mock.renameTask).not.toHaveBeenCalled();
   });
 
   it("create：订阅建立失败不回滚 → 仍 201 且 taskId 在、sendPrompt 照发", async () => {
@@ -633,44 +682,7 @@ describe("localTaskApiResponder", () => {
     expect(posted.at(-1)).toMatchObject({ ok: true, status: 200, body: { events: [], nextSeq: 0 } });
   });
 
-  it("send steer：promote 失败仍 202 + delivery=queued + warning=promote_failed，事件记 input.queued", async () => {
-    const { responder, posted, mock, log } = createHarness();
-    mock.listActiveTaskIds.mockImplementation(async () => [TASK_ID]);
-    // 先经 events op 懒订阅建 buffer，input.queued 才能进事件流。
-    await responder.handleRequest(
-      request("r0", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
-    );
-    mock.promoteTaskCommand.mockImplementation(async () => {
-      throw new Error("promote exploded");
-    });
-
-    await responder.handleRequest(
-      request("r1", {
-        kind: "send",
-        workspacePath: WORKSPACE,
-        taskId: TASK_ID,
-        text: "hello",
-        delivery: "steer",
-      }),
-    );
-
-    // enqueue 已成功：命令会被执行，受理必须可见——不能 503、不能没有事件。
-    expect(mock.enqueueTaskCommand).toHaveBeenCalledTimes(1);
-    const body = posted.at(-1)!.body as { delivery: string; commandId: string; warning?: string };
-    expect(body.delivery).toBe("queued");
-    expect(body.warning).toBe("promote_failed");
-    expect(body.commandId).toBeTruthy();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("promote exploded"));
-
-    await responder.handleRequest(
-      request("r2", { kind: "events", workspacePath: WORKSPACE, taskId: TASK_ID, after: 0, waitMs: 0 }),
-    );
-    const events = (posted.at(-1)!.body as { events: Array<{ type: string; commandId: string }> }).events;
-    expect(events.some((event) => event.type === "input.steered")).toBe(false);
-    expect(events.at(-1)).toMatchObject({ type: "input.queued", commandId: body.commandId });
-  });
-
-  it("create：renameTask 失败 → 201 + warning=rename_failed；与首条 prompt 同败时 first_prompt_failed 优先", async () => {
+  it("create：renameTask 失败（发生在 sendPrompt 成功后）→ 201 + warning=rename_failed", async () => {
     const renamed = createHarness({
       renameTask: vi.fn(async () => {
         throw new Error("rename rejected");
@@ -680,25 +692,28 @@ describe("localTaskApiResponder", () => {
       request("r1", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T" }),
     );
     expect(renamed.posted.at(-1)).toMatchObject({
-      ok: true,
       status: 201,
       body: { taskId: TASK_ID, warning: "rename_failed" },
     });
     expect(renamed.log).toHaveBeenCalledWith(expect.stringContaining("rename rejected"));
+    // rename 在首条 prompt 成功之后才被尝试。
+    expect(renamed.mock.sendPrompt).toHaveBeenCalledTimes(1);
+    expect(renamed.mock.renameTask.mock.invocationCallOrder[0]!).toBeGreaterThan(
+      renamed.mock.sendPrompt.mock.invocationCallOrder[0]!,
+    );
 
+    // rename 与首条 prompt 同败时：rename 被跳过，warning 取 first_prompt_failed。
     const both = createHarness({
-      renameTask: vi.fn(async () => {
-        throw new Error("rename rejected");
-      }),
       sendPrompt: vi.fn(async () => {
         throw new Error("prompt rejected");
       }),
+      renameTask: vi.fn(async () => null),
     });
     await both.responder.handleRequest(
       request("r2", { kind: "create", workspacePath: WORKSPACE, prompt: "hi", title: "T" }),
     );
+    expect(both.mock.renameTask).not.toHaveBeenCalled();
     expect(both.posted.at(-1)).toMatchObject({
-      ok: true,
       status: 201,
       body: { taskId: TASK_ID, warning: "first_prompt_failed" },
     });

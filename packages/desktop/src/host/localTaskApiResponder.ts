@@ -13,8 +13,6 @@ export type LocalTaskApiTaskService = Pick<
   IZCodeTaskService,
   | "createTask"
   | "sendPrompt"
-  | "enqueueTaskCommand"
-  | "promoteTaskCommand"
   | "stopGeneration"
   | "getTaskSnapshot"
   | "getTaskMeta"
@@ -32,7 +30,9 @@ export type LocalTaskApiEvent =
   | { seq: number; type: "turn.failed"; at: number; error: string }
   | { seq: number; type: "permission.requested"; at: number; summary: string }
   | { seq: number; type: "input.queued"; at: number; commandId: string }
-  | { seq: number; type: "input.steered"; at: number; commandId: string };
+  | { seq: number; type: "input.steered"; at: number; commandId: string }
+  | { seq: number; type: "steer.injected"; at: number }
+  | { seq: number; type: "steer.fellBack"; at: number; error: string };
 
 export interface LocalTaskApiEventsResult {
   events: LocalTaskApiEvent[];
@@ -161,6 +161,15 @@ export function createLocalTaskApiResponder(deps: {
               });
           } else if (event.type === "task_error") {
             appendTurnFailed(taskId, String((event as { error?: unknown }).error ?? "task failed"));
+          } else if (event.type === "turn_steer_queued") {
+            // CLI 已把 guide 请求排入引导（pendingInputId 与受理 commandId 同源：traceId 即 inputId）。
+            appendEvent(taskId, { type: "input.steered", commandId: event.pendingInputId });
+          } else if (event.type === "turn_steer_status") {
+            if (event.status === "drained") {
+              appendEvent(taskId, { type: "steer.injected" });
+            } else if (event.status === "discarded" || event.status === "rejected") {
+              appendEvent(taskId, { type: "steer.fellBack", error: event.reason ?? event.status });
+            }
           }
           // 其它流事件类型全部忽略
         }),
@@ -228,25 +237,8 @@ export function createLocalTaskApiResponder(deps: {
         deferPersistenceUntilFirstPrompt: true,
         ...(op.mode ? { mode: op.mode } : {}),
       });
-      let renameFailed = false;
-      if (op.title) {
-        try {
-          await taskService.renameTask({
-            taskId: created.taskId,
-            workspacePath: op.workspacePath,
-            title: op.title,
-          });
-        } catch (error) {
-          // 改名失败不致命：继续发送首条 prompt，warning 告知调用方。
-          renameFailed = true;
-          deps.log?.(
-            `local task api: rename failed after create (taskId=${created.taskId}): ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
-      }
-      // 任务已建成：订阅失败不回滚 create、也不让整体 503；后续首次 events 调用会懒订阅兜底。
+      // 订阅先行：首条 prompt 与 rename 的结果事件都要能进 buffer；失败不回滚 create，
+      // 后续首次 events 调用会懒订阅兜底。
       try {
         ensureSubscriptions(taskService, op.workspacePath, created.taskId);
       } catch (error) {
@@ -273,6 +265,28 @@ export function createLocalTaskApiResponder(deps: {
           }`,
         );
       }
+      // rename 放在首条 prompt 之后：deferPersistenceUntilFirstPrompt 下 session 随首条
+      // prompt 才落盘，此前 renameTask（底层 v4 renameSession）会报
+      // "Session not found after write"（真机日志实锤）。首条 prompt 已失败时 session
+      // 仍可能未落盘，跳过 rename，避免再一次必然失败。
+      let renameFailed = false;
+      if (op.title && !firstPromptFailed) {
+        try {
+          await taskService.renameTask({
+            taskId: created.taskId,
+            workspacePath: op.workspacePath,
+            title: op.title,
+          });
+        } catch (error) {
+          // 改名失败不致命：继续，warning 告知调用方。
+          renameFailed = true;
+          deps.log?.(
+            `local task api: rename failed after create (taskId=${created.taskId}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
       // warning 按严重度只取一：首条 prompt 失败重于改名失败。
       const warning = firstPromptFailed ? "first_prompt_failed" : renameFailed ? "rename_failed" : undefined;
       return { status: 201, body: { taskId: created.taskId, ...(warning ? { warning } : {}) } };
@@ -283,58 +297,38 @@ export function createLocalTaskApiResponder(deps: {
       // workspace 查不到该任务即 404）；归属表命中的请求也会再走一次，成本是一次轻量 meta 读。
       const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
       if (!meta) return { status: 404, body: { error: "task_not_found" } };
-      const active = await taskService.listActiveTaskIds({ workspacePath: op.workspacePath });
-      if (!active.includes(op.taskId)) {
-        await taskService.sendPrompt({
-          taskId: op.taskId,
-          traceId: newUUID(),
-          content: op.text,
-          clientMode: "desktop-continuous",
-        });
-        return { status: 202, body: { delivery: "sent" } };
-      }
+      // 与 GUI 运行中发送同一条链路：v4 sendText 的 requestedDelivery 交给 CLI inputRouting
+      // 裁决（guide→steering 裁决 steered/fellBack，queue→入队，缺省→按会话 followupMode）。
+      // auto 不带参数=跟随会话 followupMode（GUI 运行中默认发送行为）；
+      // queue=入队；steer=guide（运行中即时引导注入，CLI 权威裁决，结果经流事件回报）。
       const commandId = newUUID();
-      const traceId = newUUID();
-      await taskService.enqueueTaskCommand({
-        workspacePath: op.workspacePath,
+      await taskService.sendPrompt({
         taskId: op.taskId,
-        commandId,
-        traceId,
-        type: "send_prompt",
+        traceId: commandId,
         content: op.text,
+        clientMode: "desktop-continuous",
+        ...(op.delivery === "queue" ? { requestedDelivery: "queue" as const } : {}),
+        ...(op.delivery === "steer" ? { requestedDelivery: "guide" as const } : {}),
       });
-      // 受理即补订阅：保证入队事件（input.queued / input.steered）能进 buffer；
+      // 受理即补订阅：保证 steer 的权威流事件（input.steered / steer.*）能进 buffer；
       // 失败不致命（首次 events 调用懒订阅兜底），只是这批事件可能不被记录。
       try {
         ensureSubscriptions(taskService, op.workspacePath, op.taskId);
       } catch {
         // 懒订阅兜底由首次 events 调用承担
       }
-      if (op.delivery === "steer") {
-        try {
-          await taskService.promoteTaskCommand({
-            workspacePath: op.workspacePath,
-            taskId: op.taskId,
-            commandId,
-            ownerRunId: traceId,
-            clientMode: "desktop-continuous",
-          });
-          // appendEvent 前不需要 ensureSubscriptions——任务没 buffer 就忽略，正常。
-          appendEvent(op.taskId, { type: "input.steered", commandId });
-          return { status: 202, body: { delivery: "steered", commandId } };
-        } catch (error) {
-          // enqueue 已成功：命令在队列里会被执行，副作用必须如实可见（与 create 部分失败同型）。
-          deps.log?.(
-            `[local-task-api] promote failed task=${op.taskId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-          appendEvent(op.taskId, { type: "input.queued", commandId });
-          return { status: 202, body: { delivery: "queued", commandId, warning: "promote_failed" } };
-        }
+      // auto/queue 的受理事件自产（CLI 无对应专属流事件）；steer 的 input.steered 统一由
+      // turn_steer_queued 流事件投影发出（CLI 的 pendingInputId 即我们的 commandId）。
+      if (op.delivery !== "steer") {
+        appendEvent(op.taskId, { type: "input.queued", commandId });
       }
-      appendEvent(op.taskId, { type: "input.queued", commandId });
-      return { status: 202, body: { delivery: "queued", commandId } };
+      return {
+        status: 202,
+        body: {
+          delivery: op.delivery === "auto" ? "sent" : op.delivery === "queue" ? "queued" : "steered",
+          commandId,
+        },
+      };
     }
 
     if (op.kind === "stop") {
