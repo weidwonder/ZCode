@@ -196,6 +196,7 @@ import {
   clearOAuthRoutesForWindow,
   handleDeepLink,
   handleOpenWorkspacePath,
+  isValidLocalWorkspaceDirectory,
   registerDeepLinkProtocol,
   resolveExternalWorkspaceOpenDialogCopy,
 } from "./desktopOAuthDeepLink.js";
@@ -2136,6 +2137,22 @@ app.whenReady().then(async () => {
   // 必须在 setDataBaseDir 之后创建，路径跟随用户自定义数据目录。
   void createLocalTaskApi({
     resolveHost: (workspacePath) => taskRealtimeBus.findHostProcessByWorkspaceKey(workspacePath),
+    // workspace 自动打开：与 deep link / --open-workspace / Finder 同一条 handleOpenWorkspacePath
+    // 链路（当前窗口加 workspace 标签，不自定义窗口策略）；强制升级期间如实 blocked。
+    openWorkspace: (workspacePath) => {
+      if (forceUpdateMainWindowCreationBlocked) return "blocked";
+      if (!isValidLocalWorkspaceDirectory(workspacePath)) return "invalid";
+      if (getApplicationWindowsExcludingCuaIndicator().length === 0) {
+        void primaryWindowCoordinator.ensurePrimaryWindow("local-task-api-workspace");
+      }
+      // 返回值忽略：false 分支是无窗口缓存 pending——ensurePrimaryWindow 起窗后 renderer
+      // ready 会投递，opener 侧等待注册的 30s 上限兜底。
+      void handleOpenWorkspacePath(workspacePath, logger, {
+        allowWithoutReadyWindow: true,
+        resolveApplicationWindow: () => getApplicationWindowsExcludingCuaIndicator()[0] ?? null,
+      });
+      return "opened";
+    },
     zcodeVersion: ZCODE_VERSION || app.getVersion(),
     logger,
   }).then((server) => {

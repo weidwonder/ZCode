@@ -58,10 +58,14 @@ Opt-in via a config file read once at startup:
 
 ## Routing and error model
 
-- Requests are routed to the window Host that currently owns the workspace. A workspace that is not open in any window yields `409 {"error":"workspace_not_open"}` — the API never opens workspaces on its own.
+- Requests are routed to the window Host that currently owns the workspace. **Auto-open**: when the workspace is not open in any window, the API asks the app to open it — through the exact same main-process path used by deep links (`zcode://workspace/open`), the `--open-workspace` argument and the Finder "Open with ZCode" service (`handleOpenWorkspacePath`: directory validation, then a workspace tab in the existing window — no custom window policy) — and then waits (bounded, 30s) for the owning Host to register. Outcomes:
+  - path is not an existing local directory (or is a network/UNC path) → `400 {"error":"workspace_path_invalid"}`;
+  - opening is blocked app-wide (for example during a forced update) → `409 {"error":"workspace_open_blocked"}`;
+  - the workspace does not become ready within the bound → `409 {"error":"workspace_open_timeout"}` (the open request itself may still complete later; retrying the call re-checks the registry first).
+  Concurrent requests for the same workspace share one open+wait (no duplicate opens). Only local paths are affected; remote workspaces are not reachable through this API.
 - The main process keeps an in-memory map of tasks created through this API (`taskId → workspacePath`). Every `:taskId` endpoint (messages/stop/get/events/model) also accepts an **optional `workspacePath`** — a query parameter on the GET routes, a body field on the POST routes. When the map misses (for example after an app restart) and `workspacePath` is provided, the request is routed to the Host owning that workspace, which verifies the task really belongs to it; a 2xx response back-fills the map, so subsequent requests can omit `workspacePath`. A miss without `workspacePath` returns `404 {"error":"task_not_found"}`, as does a `workspacePath` the task does not belong to. After a restart the per-task event buffer starts empty: the first events call returns no events plus the current `nextSeq`, and clients can recover full state from `GET /api/tasks/:taskId`.
 - If no window Host is alive or the Host fails to answer, the API returns `503 {"error":"unavailable_host"}`; when a Host exits, its in-flight requests are settled immediately with 503 (a 300s backstop still bounds hung requests, and event long-polls are bounded by `waitMs`).
-- Error codes are stable lowercase_underscore strings in the `error` field: `unauthorized`, `host_header_forbidden`, `unsupported_media_type`, `payload_too_large`, `workspace_not_open`, `task_not_found`, `unavailable_host`, `not_found`, `method_not_allowed`, `bad_request`, `internal_error`.
+- Error codes are stable lowercase_underscore strings in the `error` field: `unauthorized`, `host_header_forbidden`, `unsupported_media_type`, `payload_too_large`, `workspace_not_open`, `workspace_path_invalid`, `workspace_open_blocked`, `workspace_open_timeout`, `task_not_found`, `unavailable_host`, `not_found`, `method_not_allowed`, `bad_request`, `internal_error`.
 
 ## Limitations
 

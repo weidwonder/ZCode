@@ -67,6 +67,9 @@ async function startServer(
   overrides: {
     readConfig?: () => Promise<LocalTaskApiConfig | null | "invalid">;
     resolveHost?: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
+    openWorkspace?: (workspacePath: string) => "opened" | "invalid" | "blocked";
+    workspaceOpenTimeoutMs?: number;
+    workspaceOpenPollMs?: number;
   } = {},
 ): Promise<{ port: number; logger: ReturnType<typeof makeLogger>; server: Server | null }> {
   const port = await reservePort();
@@ -74,6 +77,14 @@ async function startServer(
   const server = await createLocalTaskApi({
     readConfig: overrides.readConfig ?? (async () => ({ enabled: true, port, token: TOKEN })),
     resolveHost: overrides.resolveHost ?? (() => null),
+    // 与被测实现同款条件展开：不传 openWorkspace 时维持 409 workspace_not_open 旧语义。
+    ...(overrides.openWorkspace !== undefined ? { openWorkspace: overrides.openWorkspace } : {}),
+    ...(overrides.workspaceOpenTimeoutMs !== undefined
+      ? { workspaceOpenTimeoutMs: overrides.workspaceOpenTimeoutMs }
+      : {}),
+    ...(overrides.workspaceOpenPollMs !== undefined
+      ? { workspaceOpenPollMs: overrides.workspaceOpenPollMs }
+      : {}),
     zcodeVersion: ZCODE_VERSION,
     logger,
   });
@@ -224,7 +235,12 @@ describe("localTaskApi", () => {
       CREATE_BODY,
     );
     await waitForCaptured(captured, 1);
-    resolveLocalTaskApiResponse({ requestId: captured[0].requestId, ok: true, status: 200, body: { ok: true } });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
     expect((await okAuth).status).toBe(200);
   });
 
@@ -329,7 +345,12 @@ describe("localTaskApi", () => {
       CREATE_BODY,
     );
     await waitForCaptured(captured, 1);
-    resolveLocalTaskApiResponse({ requestId: captured[0].requestId, ok: true, status: 200, body: { ok: true } });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 200,
+      body: { ok: true },
+    });
     expect((await ok).status).toBe(200);
   });
 
@@ -1172,10 +1193,7 @@ describe("localTaskApi", () => {
       workspacePath: OPEN_WS,
     });
 
-    const first = send(
-      { port, method: "POST", path: "/api/tasks/t-conc/messages", headers },
-      body,
-    );
+    const first = send({ port, method: "POST", path: "/api/tasks/t-conc/messages", headers }, body);
     const second = send(
       { port, method: "POST", path: "/api/tasks/t-conc/messages", headers },
       body,
@@ -1223,7 +1241,10 @@ describe("localTaskApi", () => {
     expect((await first).status).toBe(503);
 
     // 失败未缓存：同 key 重发重新 dispatch（captured 增为 2）而不是回旧应答。
-    const second = send({ port, method: "POST", path: "/api/tasks/t-fail/messages", headers }, body);
+    const second = send(
+      { port, method: "POST", path: "/api/tasks/t-fail/messages", headers },
+      body,
+    );
     await waitForCaptured(captured, 2);
     resolveLocalTaskApiResponse({
       requestId: captured[1].requestId,
@@ -1583,5 +1604,212 @@ describe("localTaskApi", () => {
       body: { ok: true },
     });
     expect((await second).status).toBe(200);
+  });
+
+  it("workspace 自动打开：未注入 openWorkspace 维持 409 workspace_not_open（回归）", async () => {
+    const resolveHost = vi.fn(() => null);
+    const { port } = await startServer({ resolveHost });
+    const res = await send({
+      port,
+      path: `/api/tasks?workspacePath=${encodeURIComponent("/ws/none")}`,
+      headers: { authorization: BEARER },
+    });
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_not_open" });
+    expect(resolveHost).toHaveBeenCalledWith("/ws/none");
+  });
+
+  it("workspace 自动打开：invalid → 400 workspace_path_invalid，立即应答不触达 Host", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const openWorkspace = vi.fn(() => "invalid" as const);
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor(["/ws/new"], captured),
+      openWorkspace,
+    });
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/none", prompt: "hi" }),
+    );
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_path_invalid" });
+    expect(openWorkspace).toHaveBeenCalledTimes(1);
+    expect(openWorkspace).toHaveBeenCalledWith("/ws/none");
+    expect(captured).toHaveLength(0); // invalid 立即应答，未派发任何 op
+  });
+
+  it("workspace 自动打开：blocked → 409 workspace_open_blocked，立即应答不触达 Host", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const openWorkspace = vi.fn(() => "blocked" as const);
+    const { port } = await startServer({
+      resolveHost: capturingResolveHostFor(["/ws/new"], captured),
+      openWorkspace,
+    });
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/none", prompt: "hi" }),
+    );
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_open_blocked" });
+    expect(openWorkspace).toHaveBeenCalledTimes(1);
+    expect(captured).toHaveLength(0);
+  });
+
+  it("workspace 自动打开：opened 且 Host 注册及时 → 打开后派发成功回流 201", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    let opened = false;
+    const resolveHost = (ws: string) =>
+      ws === "/ws/new" && opened
+        ? {
+            postMessage: (message: unknown) => {
+              captured.push(message as HostLocalTaskApiRequestMessage);
+            },
+          }
+        : null;
+    // 用真实 setTimeout 模拟注册延迟：openWorkspace 返回后 20ms Host 才在 bus 注册。
+    const openWorkspace = vi.fn(() => {
+      setTimeout(() => {
+        opened = true;
+      }, 20);
+      return "opened" as const;
+    });
+    const { port } = await startServer({
+      resolveHost,
+      openWorkspace,
+      workspaceOpenTimeoutMs: 2_000,
+      workspaceOpenPollMs: 5,
+    });
+
+    const pending = send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/new", prompt: "hi" }),
+    );
+    await waitForCaptured(captured, 1);
+    expect(openWorkspace).toHaveBeenCalledTimes(1);
+    expect(captured[0].op).toEqual({ kind: "create", workspacePath: "/ws/new", prompt: "hi" });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-open" },
+    });
+    expect((await pending).status).toBe(201);
+  });
+
+  it("workspace 自动打开：opened 但 Host 迟迟未注册 → 409 workspace_open_timeout", async () => {
+    const openWorkspace = vi.fn(() => "opened" as const);
+    const { port, logger } = await startServer({
+      resolveHost: () => null,
+      openWorkspace,
+      workspaceOpenTimeoutMs: 30,
+      workspaceOpenPollMs: 5,
+    });
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/none", prompt: "hi" }),
+    );
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.text)).toEqual({ error: "workspace_open_timeout" });
+    expect(openWorkspace).toHaveBeenCalledTimes(1);
+    expect(
+      logger.warn.mock.calls.some((call) => String(call[0]).includes("workspace open timeout")),
+    ).toBe(true);
+  });
+
+  it("workspace 自动打开：并发同 workspace 去重，openWorkspace 只调一次、两请求都派发", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    let opened = false;
+    const resolveHost = (ws: string) =>
+      ws === "/ws/new" && opened
+        ? {
+            postMessage: (message: unknown) => {
+              captured.push(message as HostLocalTaskApiRequestMessage);
+            },
+          }
+        : null;
+    const openWorkspace = vi.fn(() => {
+      setTimeout(() => {
+        opened = true;
+      }, 40);
+      return "opened" as const;
+    });
+    const { port } = await startServer({
+      resolveHost,
+      openWorkspace,
+      workspaceOpenTimeoutMs: 2_000,
+      workspaceOpenPollMs: 5,
+    });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({ workspacePath: "/ws/new", prompt: "hi" });
+
+    const first = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    const second = send({ port, method: "POST", path: "/api/tasks", headers }, body);
+    // 两个请求共享同一次打开+等待：Host 注册后各自派发，captured 收两条。
+    await waitForCaptured(captured, 2);
+    expect(openWorkspace).toHaveBeenCalledTimes(1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-open-a" },
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-open-b" },
+    });
+    const [resA, resB] = await Promise.all([first, second]);
+    expect(resA.status).toBe(201);
+    expect(resB.status).toBe(201);
+    expect(JSON.parse(resA.text)).toEqual({ taskId: "t-open-a" });
+    expect(JSON.parse(resB.text)).toEqual({ taskId: "t-open-b" });
+  });
+
+  it("workspace 自动打开：openWorkspace 抛错 → 503 unavailable_host 且 warn 未预期异常", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const openWorkspace = vi.fn(() => {
+      throw new Error("boom");
+    });
+    const { port, logger } = await startServer({
+      resolveHost: capturingResolveHostFor(["/ws/new"], captured),
+      openWorkspace,
+    });
+    const res = await send(
+      {
+        port,
+        method: "POST",
+        path: "/api/tasks",
+        headers: { authorization: BEARER, "content-type": "application/json" },
+      },
+      JSON.stringify({ workspacePath: "/ws/none", prompt: "hi" }),
+    );
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.text)).toEqual({ error: "unavailable_host" });
+    expect(
+      logger.warn.mock.calls.some((call) =>
+        String(call[0]).includes("[local-task-api] workspace open unexpected error"),
+      ),
+    ).toBe(true);
+    expect(captured).toHaveLength(0);
   });
 });

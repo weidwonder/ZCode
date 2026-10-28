@@ -31,6 +31,10 @@ import {
   handleSetModelRoute,
   type LocalTaskApiModelRouteDeps,
 } from "./localTaskApiModelRoutes.js";
+import {
+  createLocalTaskApiWorkspaceOpener,
+  type EnsureWorkspaceReadyResult,
+} from "./localTaskApiWorkspaceOpener.js";
 
 export const LOCAL_TASK_API_CONFIG_FILE = "local-task-api.json";
 /** 开关文件 token 最短长度。 */
@@ -89,6 +93,8 @@ export async function readLocalTaskApiConfig(
 export interface LocalTaskApiDispatcherDeps {
   /** 按本地 workspacePath 找拥有它的窗口 Host；找不到返回 null。 */
   resolveHost: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
+  /** 注入后：workspace 未打开时先自动打开并有界等待 Host 注册（同 workspace 并发去重）。 */
+  ensureWorkspaceReady?: (workspacePath: string) => Promise<EnsureWorkspaceReadyResult>;
   timeoutMs?: number;
   logger?: { warn: (...args: unknown[]) => void };
 }
@@ -117,7 +123,14 @@ export function createLocalTaskApiDispatcher(deps: LocalTaskApiDispatcherDeps) {
     workspacePath: string,
     op: LocalTaskApiRequestOp,
   ): Promise<{ status: number; body: unknown }> {
-    const host = deps.resolveHost(workspacePath);
+    let host = deps.resolveHost(workspacePath);
+    if (!host && deps.ensureWorkspaceReady) {
+      // workspace 未打开：注入了自动打开时先打开并有界等待 Host 注册（同 workspace 并发去重），
+      // 结果非 ready 直接以对应错误码应答（blocked/timeout → 409 族，invalid → 400）。
+      const ready = await deps.ensureWorkspaceReady(workspacePath);
+      if (ready.kind !== "ready") return { status: ready.status, body: ready.body };
+      host = ready.host;
+    }
     if (!host) {
       return { status: 409, body: { error: "workspace_not_open" } };
     }
@@ -193,6 +206,12 @@ export interface LocalTaskApiDeps {
   /** 开关文件绝对路径；权限检查 stat 用。缺省为 getAppConfigDir() 下的默认文件。 */
   configPath?: string;
   resolveHost: (workspacePath: string) => { postMessage: (message: unknown) => void } | null;
+  /** workspace 未打开时的自动打开（与 deep link 同链路）；缺省维持 409 workspace_not_open。 */
+  openWorkspace?: (workspacePath: string) => "opened" | "invalid" | "blocked";
+  /** 自动打开后等待 Host 注册的总时限，默认 30s；测试可注入小值。 */
+  workspaceOpenTimeoutMs?: number;
+  /** 自动打开后的轮询间隔，默认 250ms；测试可注入小值。 */
+  workspaceOpenPollMs?: number;
   zcodeVersion: string;
   logger: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void };
 }
@@ -206,8 +225,18 @@ export interface LocalTaskApiDeps {
  * 是预期行为。
  */
 export async function createLocalTaskApi(deps: LocalTaskApiDeps): Promise<Server | null> {
+  const workspaceOpener = createLocalTaskApiWorkspaceOpener({
+    resolveHost: deps.resolveHost,
+    ...(deps.openWorkspace ? { openWorkspace: deps.openWorkspace } : {}),
+    ...(deps.workspaceOpenTimeoutMs !== undefined
+      ? { timeoutMs: deps.workspaceOpenTimeoutMs }
+      : {}),
+    ...(deps.workspaceOpenPollMs !== undefined ? { pollMs: deps.workspaceOpenPollMs } : {}),
+    logger: deps.logger,
+  });
   const dispatcher = createLocalTaskApiDispatcher({
     resolveHost: deps.resolveHost,
+    ensureWorkspaceReady: workspaceOpener.ensureWorkspaceReady,
     logger: deps.logger,
   });
   setLocalTaskApiDispatcher(dispatcher);
