@@ -1116,4 +1116,207 @@ describe("localTaskApi", () => {
     });
     expect(await pendingB).toEqual({ status: 200, body: { ok: true } });
   });
+
+  it("messages clientRequestId：同 key 串行重试命中幂等，回首次应答不再 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port, logger } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      text: "hi",
+      clientRequestId: "sid-1",
+      workspacePath: OPEN_WS,
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks/t-dup/messages", headers }, body);
+    await waitForCaptured(captured, 1);
+    // op 不带 clientRequestId，send 形态不变；首个请求 2xx 后回填归属表。
+    expect(captured[0].op).toEqual({
+      kind: "send",
+      workspacePath: OPEN_WS,
+      taskId: "t-dup",
+      text: "hi",
+      delivery: "auto",
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c1" },
+    });
+    const firstRes = await first;
+    expect(firstRes.status).toBe(202);
+    expect(JSON.parse(firstRes.text)).toEqual({ delivery: "queued", commandId: "c1" });
+
+    // 同 key 重试：直接回首次应答（commandId 仍是 c1），不再 dispatch，打一行 duplicate 日志。
+    const retry = await send(
+      { port, method: "POST", path: "/api/tasks/t-dup/messages", headers },
+      body,
+    );
+    expect(retry.status).toBe(202);
+    expect(JSON.parse(retry.text)).toEqual({ delivery: "queued", commandId: "c1" });
+    expect(captured).toHaveLength(1);
+    expect(
+      logger.info.mock.calls.filter((call) =>
+        String(call[0]).includes("duplicate send request=sid-1 task=t-dup"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("messages clientRequestId 并发同 key：in-flight 共享同一应答，postMessage 只收到一次 send", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port, logger } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      text: "hi",
+      clientRequestId: "sid-conc",
+      workspacePath: OPEN_WS,
+    });
+
+    const first = send(
+      { port, method: "POST", path: "/api/tasks/t-conc/messages", headers },
+      body,
+    );
+    const second = send(
+      { port, method: "POST", path: "/api/tasks/t-conc/messages", headers },
+      body,
+    );
+    // 回流前两个请求都已 in-flight：首个已 dispatch、次个已挂在共享 future 上。
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(captured).toHaveLength(1); // 只 dispatch 一次
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c-conc" },
+    });
+    const [resA, resB] = await Promise.all([first, second]);
+    expect(resA.status).toBe(202);
+    expect(resB.status).toBe(202);
+    expect(JSON.parse(resA.text)).toEqual({ delivery: "queued", commandId: "c-conc" });
+    expect(JSON.parse(resB.text)).toEqual({ delivery: "queued", commandId: "c-conc" });
+    // 只有等待方打 duplicate 日志（首个请求不打）。
+    expect(
+      logger.info.mock.calls.filter((call) =>
+        String(call[0]).includes("duplicate send request=sid-conc task=t-conc"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("messages clientRequestId 失败不缓存：同 key 重发重新 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const body = JSON.stringify({
+      text: "hi",
+      clientRequestId: "sid-fail",
+      workspacePath: OPEN_WS,
+    });
+
+    const first = send({ port, method: "POST", path: "/api/tasks/t-fail/messages", headers }, body);
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: false,
+      status: 503,
+      body: { error: "unavailable_host" },
+    });
+    expect((await first).status).toBe(503);
+
+    // 失败未缓存：同 key 重发重新 dispatch（captured 增为 2）而不是回旧应答。
+    const second = send({ port, method: "POST", path: "/api/tasks/t-fail/messages", headers }, body);
+    await waitForCaptured(captured, 2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c-retry" },
+    });
+    const retry = await second;
+    expect(retry.status).toBe(202);
+    expect(JSON.parse(retry.text)).toEqual({ delivery: "queued", commandId: "c-retry" });
+  });
+
+  it("messages clientRequestId：不同任务同 key 互不影响，各自 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    // 先 create 两个任务登记归属（同一 workspace，归属表各自登记）。
+    const createA = send({ port, method: "POST", path: "/api/tasks", headers }, CREATE_BODY);
+    await waitForCaptured(captured, 1);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-a" },
+    });
+    expect((await createA).status).toBe(201);
+
+    const createB = send({ port, method: "POST", path: "/api/tasks", headers }, CREATE_BODY);
+    await waitForCaptured(captured, 2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-b" },
+    });
+    expect((await createB).status).toBe(201);
+
+    const sendA = send(
+      { port, method: "POST", path: "/api/tasks/t-a/messages", headers },
+      JSON.stringify({ text: "x", clientRequestId: "sid-shared" }),
+    );
+    await waitForCaptured(captured, 3);
+    resolveLocalTaskApiResponse({
+      requestId: captured[2].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c-a" },
+    });
+    expect((await sendA).status).toBe(202);
+
+    // 同一 clientRequestId 打到任务 B：命名空间按任务分隔，必须重新 dispatch。
+    const sendB = send(
+      { port, method: "POST", path: "/api/tasks/t-b/messages", headers },
+      JSON.stringify({ text: "x", clientRequestId: "sid-shared" }),
+    );
+    await waitForCaptured(captured, 4);
+    expect(captured[3].op).toEqual({
+      kind: "send",
+      workspacePath: OPEN_WS,
+      taskId: "t-b",
+      text: "x",
+      delivery: "auto",
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[3].requestId,
+      ok: true,
+      status: 202,
+      body: { delivery: "queued", commandId: "c-b" },
+    });
+    const resB = await sendB;
+    expect(resB.status).toBe(202);
+    expect(JSON.parse(resB.text)).toEqual({ delivery: "queued", commandId: "c-b" });
+  });
+
+  it("messages clientRequestId 非法：空串与 201 字符 → 400 不 dispatch", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const { port } = await startServer({ resolveHost: capturingResolveHost(captured) });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+
+    const empty = await send(
+      { port, method: "POST", path: "/api/tasks/t-bad/messages", headers },
+      JSON.stringify({ text: "x", clientRequestId: "", workspacePath: OPEN_WS }),
+    );
+    expect(empty.status).toBe(400);
+    expect(JSON.parse(empty.text)).toEqual({ error: "bad_request" });
+
+    const tooLong = await send(
+      { port, method: "POST", path: "/api/tasks/t-bad/messages", headers },
+      JSON.stringify({ text: "x", clientRequestId: "x".repeat(201), workspacePath: OPEN_WS }),
+    );
+    expect(tooLong.status).toBe(400);
+    expect(JSON.parse(tooLong.text)).toEqual({ error: "bad_request" });
+    expect(captured).toHaveLength(0); // 两个 400 都未触达 Host
+  });
 });
