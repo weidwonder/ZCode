@@ -754,6 +754,7 @@ exceptions:
       - packages/desktop/src/main/localTaskApiClientRequestId.ts
       - packages/desktop/src/main/localTaskApiHttpUtil.ts
       - packages/desktop/src/main/localTaskApiModelRoutes.ts
+      - packages/desktop/src/main/localTaskApiWorkspaceOpener.ts
       - packages/desktop/src/host/localTaskApiResponder.ts
     reason: 本机任务 API（docs/local-task-api.md）：Main 进程监听与 Host 侧应答器的新文件族（传输工具与模型路由两个拆分文件为守 800 行 lint 上限而生），传输层鉴权/路由在 Main、任务业务与事件缓冲在窗口 Host；补丁需长期跟随上游 rebase，接管 desktop 全目录的治理面远超本次改动，不为几个文件整体 adopt。
   - id: side-pane-full-view-shortcut-command-edit

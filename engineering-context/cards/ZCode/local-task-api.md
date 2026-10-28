@@ -15,6 +15,7 @@
 | Main 监听与鉴权 | `packages/desktop/src/main/localTaskApi.ts#createLocalTaskApi` | HTTP(loopback) | v2 | 桥接程序 | 开关文件 local-task-api.json（enabled/port/token≥32）；Host 头→Bearer(sha256+timingSafeEqual)→Content-Type→16MiB |
 | taskId 重锚定（重启后接续） | Main 侧 `resolveTaskWorkspace`（同上文件）；Host 校验用 `packages/services/src/session/zcodeTaskService.ts#IZCodeTaskService` 的 getTaskMeta | 内部 | v2 | 桥接程序 | 归属表未命中 + 请求带 workspacePath → Host getTaskMeta 核实（null→404）→ 2xx 回填归属表；未命中未带 → 404 |
 | Host 应答器（九 op + 事件 ring buffer） | `packages/desktop/src/host/localTaskApiResponder.ts#createLocalTaskApiResponder` | 内部 | v2 | Main 转发 | buffer 每任务 500 条；resync 语义；事件缓冲在 Host（Main 不承载业务状态）；send/stop/setModel/events 前置 getTaskMeta 归属校验 |
+| workspace 自动打开（未打开 → 打开后派发） | 注入实现 `packages/desktop/src/main/index.ts`（openWorkspace deps）→ 共用函数 `packages/desktop/src/main/desktopOAuthDeepLink.ts#handleOpenWorkspacePath`（与 deep link/--open-workspace/Finder 同链路，当前窗口加标签）；等待/去重/错误码在 `packages/desktop/src/main/localTaskApiWorkspaceOpener.ts` | 内部 | v2 | Main dispatcher 未命中 Host 时 | 30s 有界等待、同 workspace 并发去重；invalid=400/blocked=409/timeout=409；只对本地路径生效 |
 | 模型候选投影（/api/models，GUI 新建对话同源） | `packages/services/src/model-provider/providerFacadeServices.ts#IModelSelectionService`（getView，本地容器装配 `packages/services/src/node.ts:2984-2984`）；GUI 分组先例 `packages/ui/src/lib/modelSelectionGroups.ts:33-78`、思考档位 `packages/ui/src/lib/modelThoughtOption.ts:5-34`（optionSpecs.reasoningLevel.values）、默认 automation 先例 `packages/desktop/src/host/automationModelSelection.ts:23-27` | 内部 | canonical | /api models 投影 | thoughtLevels 缺失 → 空数组；isDefault 按顶层 preferredSelection 命中；不做 GUI selectedProvider 菜单过滤 |
 | 任务换模型（/:id/model） | `packages/services/src/session/zcodeTaskService.ts#IZCodeTaskService`（setModel，adapter 直发 runtime，`packages/services/src/zcode-agent/zcodeTaskServiceAdapter.ts:2859-2873`） | 内部 | canonical | /:id/model op | 运行中允许（GUI 仅 Highspeed 锁，packages/ui/src/v4/SessionPane.tsx:4408-4415；Highspeed 是 UI 运行态 Host 不可见，agent 拒绝 → 503）；clientRequestId 幂等独立 model 命名空间（key 前缀 `model\0` 与 send 隔离） |
 
@@ -24,6 +25,7 @@
 - enqueueTaskCommand+promoteTaskCommand 当 steer 用 — 真机证实只是插队首不是即时引导；运行中引导的正确原语是 sendPrompt 带 requestedDelivery:"guide"（sendPrompt 底层即 v4 sendText，zcodeTaskServiceAdapter.ts:457-477）
 - deferPersistenceUntilFirstPrompt 的任务在首条 prompt 前 renameTask — session 未落盘，renameSession 报 Session not found after write；改名必须在 sendPrompt 之后
 - 自己拼模型候选列表 — 唯一来源是 IModelSelectionService.getView()（GUI 新建对话同一条）；思考档位在模型 config.optionSpecs.reasoningLevel.values（GUI 投影先例 resolveModelThoughtOption），deprecated 的 createTask model/thoughtLevel 字段不要用
+- 自己造「打开工作区」的窗口策略（新窗口/前台抢占） — 必须复用 handleOpenWorkspacePath（当前窗口加 workspace 标签、tab 去重）；等待 Host 注册有 30s 上限，超时如实 409 workspace_open_timeout
 - 给换模型端点加「运行中 409」 — GUI 普通运行中不锁模型（仅 Highspeed 卡激活时锁）；Highspeed 是 UI 运行态 Host 侧拿不到，别在 API 层臆造禁止条件
 
 ## 测试入口
@@ -31,4 +33,4 @@
 - `packages/desktop/test/localTaskApiResponder.test.ts`、`packages/desktop/test/localTaskApi.test.ts`（mock IZCodeTaskService，Pick 面类型绑定）
 
 ## 确认
-2026-10-28｜来源：packages/services/src/session/zcodeTaskService.ts、packages/desktop/src/host/index.ts、packages/desktop/src/main/taskRealtimeBus.ts、packages/shared/src/zcode-task-types-core.ts、packages/services/src/model-provider/providerFacadeServices.ts、packages/provider/src/facades.ts、packages/ui/src/lib/modelSelectionGroups.ts、packages/ui/src/lib/modelThoughtOption.ts、packages/ui/src/v4/ConversationComposer.tsx、packages/ui/src/v4/SessionPane.tsx（GUI 语义：引导与换模型）
+2026-10-28｜来源：packages/services/src/session/zcodeTaskService.ts、packages/desktop/src/host/index.ts、packages/desktop/src/main/taskRealtimeBus.ts、packages/shared/src/zcode-task-types-core.ts、packages/services/src/model-provider/providerFacadeServices.ts、packages/provider/src/facades.ts、packages/ui/src/lib/modelSelectionGroups.ts、packages/ui/src/lib/modelThoughtOption.ts、packages/ui/src/v4/ConversationComposer.tsx、packages/ui/src/v4/SessionPane.tsx（GUI 语义：引导与换模型）、packages/desktop/src/main/desktopOAuthDeepLink.ts（打开工作区链路）
