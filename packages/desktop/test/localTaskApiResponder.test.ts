@@ -1114,6 +1114,31 @@ describe("localTaskApiResponder", () => {
     expect(mock.createTask).not.toHaveBeenCalled();
   });
 
+  it("create：account-connection-unavailable → 400 invalid_model_selection 且不建任务", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({ selectionIssue: "account-connection-unavailable" }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: {
+          providerId: "account:bigmodel-individual-coding-plan",
+          modelId: "GLM-5.3-Flash",
+        },
+      }),
+    );
+
+    expect(mock.createTask).not.toHaveBeenCalled();
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 400,
+      body: { error: "invalid_model_selection", message: "account-connection-unavailable" },
+    });
+  });
+
   it("create：无 issue → 透传 effectiveSelection（服务端归一后的选择，不用请求原值）", async () => {
     const { responder, posted, mock } = createHarness({}, {
       getView: async () => ({

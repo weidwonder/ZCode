@@ -70,6 +70,7 @@ async function startServer(
     openWorkspace?: (workspacePath: string) => "opened" | "invalid" | "blocked";
     workspaceOpenTimeoutMs?: number;
     workspaceOpenPollMs?: number;
+    workspaceOpenReopenEveryMs?: number;
   } = {},
 ): Promise<{ port: number; logger: ReturnType<typeof makeLogger>; server: Server | null }> {
   const port = await reservePort();
@@ -84,6 +85,9 @@ async function startServer(
       : {}),
     ...(overrides.workspaceOpenPollMs !== undefined
       ? { workspaceOpenPollMs: overrides.workspaceOpenPollMs }
+      : {}),
+    ...(overrides.workspaceOpenReopenEveryMs !== undefined
+      ? { workspaceOpenReopenEveryMs: overrides.workspaceOpenReopenEveryMs }
       : {}),
     zcodeVersion: ZCODE_VERSION,
     logger,
@@ -1783,6 +1787,65 @@ describe("localTaskApi", () => {
     expect(resB.status).toBe(201);
     expect(JSON.parse(resA.text)).toEqual({ taskId: "t-open-a" });
     expect(JSON.parse(resB.text)).toEqual({ taskId: "t-open-b" });
+  });
+
+  it("workspace 自动打开：跨 workspace 并发（单槽覆盖模拟）靠重发自愈，两请求都派发", async () => {
+    const captured: HostLocalTaskApiRequestMessage[] = [];
+    const openCalls: string[] = [];
+    let lastRequested: string | null = null;
+    const registered = new Set<string>();
+    // 模拟上游 pendingOpenWorkspaceRequest 单槽：只有「最后一次被请求」的 workspace 会在 15ms 后
+    // 注册，先到的被后到的覆盖（这正是上游 desktopOAuthDeepLink.ts 的行为）。
+    // 时序：B 紧随 A 发出时 lastRequested=B，A 的 15ms 注册被覆盖；A 的 opener 每 10ms 重发把
+    // lastRequested 拿回，A 得以注册（若偶现不稳定，把 reopenEveryMs 调到 5、注册延迟调到 20，
+    // 保证覆盖窗口内必有重发）。
+    const openWorkspace = vi.fn((ws: string) => {
+      openCalls.push(ws);
+      lastRequested = ws;
+      const winner = ws;
+      setTimeout(() => {
+        if (lastRequested === winner) registered.add(winner);
+      }, 15);
+      return "opened" as const;
+    });
+    const resolveHost = (ws: string) =>
+      registered.has(ws)
+        ? {
+            postMessage: (message: unknown) => {
+              captured.push(message as HostLocalTaskApiRequestMessage);
+            },
+          }
+        : null;
+    const { port } = await startServer({
+      resolveHost,
+      openWorkspace,
+      workspaceOpenTimeoutMs: 5_000,
+      workspaceOpenPollMs: 3,
+      workspaceOpenReopenEveryMs: 10, // 重发快于覆盖窗口，两个 ws 轮流拿到注册机会
+    });
+    const headers = { authorization: BEARER, "content-type": "application/json" };
+    const bodyA = JSON.stringify({ workspacePath: "/ws/cc-a", prompt: "hi" });
+    const bodyB = JSON.stringify({ workspacePath: "/ws/cc-b", prompt: "hi" });
+    const first = send({ port, method: "POST", path: "/api/tasks", headers }, bodyA);
+    const second = send({ port, method: "POST", path: "/api/tasks", headers }, bodyB);
+    await waitForCaptured(captured, 2);
+    // 重发生效：被覆盖的一方（A）必被再次请求打开
+    const aCalls = openCalls.filter((ws) => ws === "/ws/cc-a").length;
+    expect(aCalls).toBeGreaterThanOrEqual(2);
+    resolveLocalTaskApiResponse({
+      requestId: captured[0].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-cc-a" },
+    });
+    resolveLocalTaskApiResponse({
+      requestId: captured[1].requestId,
+      ok: true,
+      status: 201,
+      body: { taskId: "t-cc-b" },
+    });
+    expect((await first).status).toBe(201);
+    expect((await second).status).toBe(201);
   });
 
   it("workspace 自动打开：openWorkspace 抛错 → 503 unavailable_host 且 warn 未预期异常", async () => {
