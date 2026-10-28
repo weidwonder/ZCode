@@ -1548,6 +1548,18 @@ export const zcodeTurnStartedEventPayloadSchema = z
 const zcodeTurnSteerSourceSchema = z.enum(["plan_approval_feedback", "workflow_refine_feedback"]);
 const zcodeTurnSteerCommandKindSchema = z.enum(["sendText", "sendGoalCommand", "compact"]);
 const zcodeTurnSteerDeliverySchema = z.enum(["queue", "guide"]);
+/** CLI runtime 的输入呈现标记（apps/zcode-cli contracts 的 RuntimeInputPresentationSchema 同枚举）。
+ * runtime 发 turn.steerQueued 会带 inputPresentation；strict schema 未收录会以
+ * unrecognized_keys 丢弃整条事件（真机 2026-10-28：input.steered 永不到达）。 */
+const zcodeRuntimeInputPresentationSchema = z.enum([
+  "user_steer",
+  "coordinator_steer",
+  "coordinator_input",
+  "subagent_reply_steer",
+  "subagent_reply",
+  "task_notification_steer",
+  "task_notification",
+]);
 
 export const zcodeTurnSteerQueuedEventPayloadSchema = z
   .object({
@@ -1561,6 +1573,7 @@ export const zcodeTurnSteerQueuedEventPayloadSchema = z
     source: zcodeTurnSteerSourceSchema.optional(),
     toolDisallowlist: z.array(nonEmptyString).optional(),
     delivery: zcodeTurnSteerDeliverySchema.optional(),
+    inputPresentation: zcodeRuntimeInputPresentationSchema.optional(),
     targetTurnId: nonEmptyString,
     queueLength: z.number().int().nonnegative(),
     intent: jsonObjectSchema.optional(),

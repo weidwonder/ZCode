@@ -206,6 +206,16 @@ export class TaskRealtimeBus {
     });
   }
 
+  /** 按本地 workspaceKey 查已注册 Host 的进程句柄；本地 workspace 的 key 即 workspacePath（task-realtime-core 的 workspaceKey 语义）。 */
+  findHostProcessByWorkspaceKey(workspaceKey: string): ElectronUtilityProcess | null {
+    for (const registered of this.hosts.values()) {
+      if (registered.workspaceKeys.has(workspaceKey)) {
+        return registered.child;
+      }
+    }
+    return null;
+  }
+
   updateHostWorkspaceKeys(hostId: string, workspaceKeys: Iterable<string>): void {
     const registered = this.hosts.get(hostId);
     if (!registered) {

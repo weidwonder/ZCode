@@ -121,7 +121,7 @@ ACK 丢失或重连时，`commands/query` 每次最多查询 64 个 `{sessionId,
 `unknown`；同 key 查询与执行必须 single-flight。
 
 `turn.steerQueued` 与 `turn.steerDrained` 的 shared strict schema 必须完整覆盖 CLI runtime 发出的
-additive 事实。queued payload 包括可选的 `delivery`、`intent`、`toolDisallowlist`；drained payload
+additive 事实。queued payload 包括可选的 `delivery`、`intent`、`toolDisallowlist`、`inputPresentation`；drained payload
 包括可选的 `drainedInputs[]`，每项保留 `pendingInputId`、持久化 `messageId`、文本及相同的投递元数据。
 Agent Service 不得因这些已声明字段触发 `unrecognized_keys` 并丢弃事件；queue/guide 的权威状态仍只
 由 CLI runtime 持有。

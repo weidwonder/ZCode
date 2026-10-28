@@ -1452,6 +1452,7 @@ describe("ZCode Protocol", () => {
         inputPreview: "继续检查",
         inputSize: 4,
         delivery: "guide",
+        inputPresentation: "user_steer",
         intent: { delivery: "guide", sourceCommandId: "command_1" },
         toolDisallowlist: ["Write"],
         targetTurnId: "turn_1",
@@ -1486,6 +1487,40 @@ describe("ZCode Protocol", () => {
     expect(drained.payload).toMatchObject({
       drainedInputs: [{ messageId: "message_1", delivery: "guide" }],
     });
+  });
+
+  it("accepts every runtime inputPresentation value and rejects unknown ones on steerQueued", () => {
+    const base = {
+      eventId: "evt_steer_presentation_1",
+      seq: 21,
+      sessionId: "sess_1",
+      timestamp: 30,
+      type: "turn.steerQueued",
+    };
+    const payload = {
+      pendingInputId: "pending_2",
+      input: "hi",
+      inputPreview: "hi",
+      inputSize: 2,
+      targetTurnId: "turn_1",
+      queueLength: 1,
+    };
+    for (const value of [
+      "user_steer",
+      "coordinator_steer",
+      "coordinator_input",
+      "subagent_reply_steer",
+      "subagent_reply",
+      "task_notification_steer",
+      "task_notification",
+    ]) {
+      expect(() =>
+        zcodeSessionEventSchema.parse({ ...base, payload: { ...payload, inputPresentation: value } }),
+      ).not.toThrow();
+    }
+    expect(() =>
+      zcodeSessionEventSchema.parse({ ...base, payload: { ...payload, inputPresentation: "bogus" } }),
+    ).toThrow();
   });
 
   it("parses typed session events for tool updates", () => {
