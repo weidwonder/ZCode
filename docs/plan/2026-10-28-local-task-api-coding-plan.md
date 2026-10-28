@@ -5,7 +5,7 @@ archived: ''
 last_confirmed: '2026-10-28'
 authority_refs:
   - 'LocalTaskApiRequest/Response 消息形状（spec §2）'
-  - 'Host responder 六 op 行为（spec §4）'
+  - 'Host responder 八 op 行为（spec §4）'
   - 'createLocalTaskApi(deps) 与 dispatcher 注入形状'
 ---
 
@@ -85,6 +85,17 @@ authority_refs:
 - 主会话：GUI 同源投影链调查（modelSelectionGroups/modelThoughtOption/automationModelSelection 三先例 cite）、文档与卡片、审读、亲跑验证、提交（04b977b1 / 1f04bddf）。
 
 **验证:** 同 Task 4 全量五件套（81/81、lint 0 errors、architecture 0 违规、lint-cards 0 违规）。
+
+### Task 6（workspace 自动打开 + 真机加固轮，两批 haiku + 主会话）：FR-020 与模型预检
+
+**满足:** FR-020 及 r8/r9 评审各项 ｜ **依赖:** Task 2 dispatcher
+
+- 批 1（haiku）：`localTaskApiWorkspaceOpener.ts`（open→有界等待 30s/250ms、同 workspace in-flight 去重、invalid/blocked/timeout 错误码）+ main/index.ts 注入（handleOpenWorkspacePath 同链路）+ 测试 +7。
+- 批 2（haiku）：跨 workspace 单槽覆盖修复——等待期每 2s 重发 openWorkspace（幂等：renderer handleSelectProject 已开只激活）+ open 失败日志去路径改 request= 关联 + 跨 workspace 并发用例 + account-connection-unavailable 用例。
+- r8（两批 haiku）：shared steerQueued schema 补 inputPresentation（fix 单列提交）；responder 模型选择预检（getView({selection})、补 defaultThoughtLevel 最高档、400 invalid_model_selection）+ 用例 +9。
+- 主会话：打开链路调查（handleOpenWorkspacePath/completeNewModelSelection cite）、文档与卡片、审读、亲验、提交（6ccaccbb/dbacbbd8/2aee92d8/8cc0de0f/904f6866 及 r9 轮）。
+
+**验证:** 同 Task 4 全量五件套（r9 轮：Main 52 + Host 47 共 99 例 + shared 85 例、lint 0 errors、architecture 0 违规、lint-cards 0 违规）。
 
 ---
 
