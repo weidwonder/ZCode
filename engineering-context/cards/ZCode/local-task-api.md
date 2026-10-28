@@ -31,4 +31,4 @@
 - `packages/desktop/test/localTaskApiResponder.test.ts`、`packages/desktop/test/localTaskApi.test.ts`（mock IZCodeTaskService，Pick 面类型绑定）
 
 ## 确认
-2026-10-28｜来源：packages/services/src/session/zcodeTaskService.ts、packages/desktop/src/host/index.ts、packages/desktop/src/main/taskRealtimeBus.ts、packages/shared/src/zcode-task-types-core.ts、packages/ui/src/v4/ConversationComposer.tsx（GUI 语义调查）；模型选择轮增补：packages/services/src/model-provider/providerFacadeServices.ts、packages/provider/src/facades.ts、packages/ui/src/lib/modelSelectionGroups.ts、packages/ui/src/lib/modelThoughtOption.ts、packages/ui/src/v4/SessionPane.tsx（换模型 GUI 语义）
+2026-10-28｜来源：packages/services/src/session/zcodeTaskService.ts、packages/desktop/src/host/index.ts、packages/desktop/src/main/taskRealtimeBus.ts、packages/shared/src/zcode-task-types-core.ts、packages/services/src/model-provider/providerFacadeServices.ts、packages/provider/src/facades.ts、packages/ui/src/lib/modelSelectionGroups.ts、packages/ui/src/lib/modelThoughtOption.ts、packages/ui/src/v4/ConversationComposer.tsx、packages/ui/src/v4/SessionPane.tsx（GUI 语义：引导与换模型）

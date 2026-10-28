@@ -35,7 +35,7 @@ authority_refs:
 - `HostMessageTypes.LocalTaskApiRequest = "local-task-api-request"`；`HostResponseTypes.LocalTaskApiResponse = "local-task-api-response"`。
 - zod schema `localTaskApiRequestOpSchema`（discriminated by kind）与两个消息 schema（spec §2 形状）+ TS 类型导出 `HostLocalTaskApiRequestMessage` / `HostLocalTaskApiResponseMessage`。
 - `createLocalTaskApiResponder(deps: { getServices, post, now?, randomUUID? })` → `{ handleRequest(msg) }`。
-- 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|""|""|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（签名变化编译红）。
+- 业务面类型 `LocalTaskApiTaskService = Pick<IZCodeTaskService, "createTask"|"sendPrompt"|"stopGeneration"|"getTaskSnapshot"|"getTaskMeta"|"listTasks"|"listActiveTaskIds"|"renameTask"|"setModel"|"onDynamicTaskEvent"|"onDynamicTaskTerminalOutcome">`（11 项，与 `localTaskApiResponder.ts` 的实际 Pick 面逐项一致；签名变化编译红）。
 
 **要点:** 六 op 按 spec §4 实现；事件 ring buffer（每 task 500 条 + waiter 长轮询（唤醒按各 waiter 的 after 过滤）+ resync）；订阅生命周期（create/send 受理时建立，任务终态后 10 分钟整体释放订阅与缓冲（懒重建，after>0 回 resync）；其余随 Host 进程退出回收——responder 不单独接入 disposeHostResources 链，属有意取舍）；无 services → status 503 body {error:"unavailable_host"}；异常 catch → ok:false（出站固定文案，原文进日志）。
 
@@ -74,6 +74,17 @@ authority_refs:
 ### Task 4（本会话）：dw 产物与验证
 
 卡片（desktop-host-ipc 刷新 + 新 local-task-api 域卡 + registry）、CHANGELOG 重写、architecture-policy 例外改新文件名、`ctx lint-cards`、typecheck/lint/单测/architecture:check 全量真跑、spec AC 回填。
+
+### Task 5（模型选择轮，三批 haiku + 主会话）：create 选模型 / GET /api/models / POST /:id/model
+
+**满足:** FR-017、FR-018、FR-019 ｜ **依赖:** Task 1/2 既有管线
+
+- 批 A（haiku）：shared `localTaskApiRequestOpSchema` 增 `modelSelection?`/`setModel`/`listModels` 三 op；幂等模块加 model 命名空间（key 前缀 `model\0`）；Main 侧 `localTaskApiHttpUtil.ts`（纯工具拆出）与 `localTaskApiModelRoutes.ts`（两条模型路由）拆分守 800 行。
+- 批 B（haiku）：Host responder——create 透传 modelSelection、listModels 经 `IModelSelectionService.getView()` 投影、setModel 前置归属校验。
+- 批 C（haiku）：测试 +15（Main 9 + responder 6，66→81）。
+- 主会话：GUI 同源投影链调查（modelSelectionGroups/modelThoughtOption/automationModelSelection 三先例 cite）、文档与卡片、审读、亲跑验证、提交（04b977b1 / 1f04bddf）。
+
+**验证:** 同 Task 4 全量五件套（81/81、lint 0 errors、architecture 0 违规、lint-cards 0 违规）。
 
 ---
 

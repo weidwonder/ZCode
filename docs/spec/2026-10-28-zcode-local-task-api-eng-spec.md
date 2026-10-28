@@ -4,7 +4,7 @@ superseded_by: ''
 archived: ''
 last_confirmed: '2026-10-28'
 authority_refs:
-  - '本机任务 API 端点契约（health/auth/tasks/messages/stop/get/events/list，见 docs/local-task-api.md）'
+  - '本机任务 API 端点契约（health/auth/tasks/messages/stop/get/events/list/models/tasks-:id-model，见 docs/local-task-api.md）'
   - '开关文件 local-task-api.json 的读取与鉴权语义（enabled/port/token）'
   - 'main↔host 消息对 LocalTaskApiRequest / LocalTaskApiResponse 的 payload 契约'
   - '五态投影与事件类型投影（IZCodeTaskService → HTTP 字段）'
