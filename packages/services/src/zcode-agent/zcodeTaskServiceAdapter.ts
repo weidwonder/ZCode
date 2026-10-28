@@ -397,6 +397,7 @@ export function createZCodeTaskServiceAdapter(
       botDeliveryTarget?: ZCodeAutomationBotDeliveryTarget;
       clientId?: string;
       clientMode?: ZCodeTaskClientMode;
+      requestedDelivery?: "startNow" | "queue" | "guide";
       logReason?: string;
       modelSelection?: CommandPayloadMap["sendText"]["modelSelection"];
       modelExecution?: CommandPayloadMap["sendText"]["modelExecution"];
@@ -464,6 +465,7 @@ export function createZCodeTaskServiceAdapter(
             payload: {
               text: params.content,
               heldQueueDisposition: "keepQueueAndSend",
+              ...(params.requestedDelivery ? { requestedDelivery: params.requestedDelivery } : {}),
               ...(params.modelSelection ? { modelSelection: params.modelSelection } : {}),
               ...(params.modelExecution ? { modelExecution: params.modelExecution } : {}),
               ...turnAttributionOf(params),
@@ -2094,6 +2096,7 @@ export function createZCodeTaskServiceAdapter(
         botDeliveryTarget: params.botDeliveryTarget,
         clientId: params.clientId,
         clientMode: params.clientMode,
+        requestedDelivery: params.requestedDelivery,
         modelSelection: params.modelSelection,
         modelExecution: params.modelExecution,
       });
