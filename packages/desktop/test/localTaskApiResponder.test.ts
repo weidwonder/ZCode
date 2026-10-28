@@ -16,9 +16,13 @@ interface Harness {
 }
 
 /** ServiceCollection + 11 个 Pick 面方法全量 mock；post 收集到数组。
- * modelSelectionView 非 undefined 时额外注册 IModelSelectionService（listModels op 用；
- * 缺省不注册 → listModels 走 503 分支，其余 op 不受影响）。 */
-function createHarness(overrides: Record<string, unknown> = {}, modelSelectionView?: unknown): Harness {
+ * modelSelectionService 非 undefined 时按原样注册 IModelSelectionService（listModels 与
+ * create/setModel 的模型选择预检都用；缺省不注册 → listModels 走 503 分支、create/setModel
+ * 的预检透传原样，其余 op 不受影响）。 */
+function createHarness(
+  overrides: Record<string, unknown> = {},
+  modelSelectionService?: { getView: (input?: { selection: unknown }) => Promise<unknown> },
+): Harness {
   const eventListeners: Array<(event: unknown) => void> = [];
   const terminalListeners: Array<(outcome: unknown) => void> = [];
   const mock: Record<string, ReturnType<typeof vi.fn>> = {
@@ -58,11 +62,8 @@ function createHarness(overrides: Record<string, unknown> = {}, modelSelectionVi
   };
   const services = new ServiceCollection();
   services.register(IZCodeTaskService, mock as unknown as IZCodeTaskService);
-  if (modelSelectionView !== undefined) {
-    services.register(
-      IModelSelectionService,
-      { getView: vi.fn(async () => modelSelectionView) } as never,
-    );
+  if (modelSelectionService) {
+    services.register(IModelSelectionService, modelSelectionService as never);
   }
   const posted: HostLocalTaskApiResponseMessage[] = [];
   const log = vi.fn();
@@ -844,7 +845,7 @@ describe("localTaskApiResponder", () => {
     expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
   });
 
-  it("listModels：getView() 投影 providers/models（displayName 回落、thoughtLevels 缺省空、isDefault 按 preferred）", async () => {
+  it("listModels：getView() 投影 providers/models（displayName 回落、thoughtLevels 缺省空、defaultThoughtLevel 同源 values.at(-1)、isDefault 按 preferred）", async () => {
     // 形状对齐 ModelSelectionView：providerName 可缺省；config.optionSpecs 按
     // RegistryModelConfigObject 恒存在（reasoningLevel 才可缺省）。
     const view = {
@@ -870,7 +871,7 @@ describe("localTaskApiResponder", () => {
       ],
       preferredSelection: { providerId: "glm", modelId: "glm-4.7", options: { reasoningLevel: "high" } },
     };
-    const { responder, posted } = createHarness({}, view);
+    const { responder, posted } = createHarness({}, { getView: async () => view });
 
     await responder.handleRequest(request("r2", { kind: "listModels", workspacePath: WORKSPACE }));
 
@@ -889,6 +890,8 @@ describe("localTaskApiResponder", () => {
                 modelId: "glm-4.7",
                 displayName: "glm-4.7",
                 thoughtLevels: ["low", "high"],
+                // 与 GUI 新建对话补档位同源：values.at(-1)。
+                defaultThoughtLevel: "high",
                 isDefault: true,
               },
               {
@@ -985,5 +988,235 @@ describe("localTaskApiResponder", () => {
     expect(JSON.stringify(posted.at(-1)!.body)).not.toContain("boom");
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("boom"));
+  });
+
+  it("create：reasoning-level-missing 按 GUI 同源补最高档（values.at(-1)），posted 201", async () => {
+    const getView = vi.fn(async () => ({
+      providers: [
+        {
+          providerId: "p",
+          config: {},
+          models: [
+            { modelId: "m", config: { optionSpecs: { reasoningLevel: { values: ["low", "high"] } } } },
+          ],
+        },
+      ],
+      selectionIssue: "reasoning-level-missing",
+    }));
+    const { responder, posted, mock } = createHarness({}, { getView });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(getView).toHaveBeenCalledWith({ selection: { providerId: "p", modelId: "m" } });
+    expect(mock.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelSelection: { providerId: "p", modelId: "m", options: { reasoningLevel: "high" } },
+      }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
+  });
+
+  it("create：reasoning-level-missing 但模型无档位 → 原样透传（CLI 对无档位模型不要求）", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({
+        providers: [
+          { providerId: "p", config: {}, models: [{ modelId: "m", config: { optionSpecs: {} } }] },
+        ],
+        selectionIssue: "reasoning-level-missing",
+      }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(mock.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({ modelSelection: { providerId: "p", modelId: "m" } }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201 });
+  });
+
+  it("create：provider-not-found → 400 invalid_model_selection，不触达 createTask", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({ selectionIssue: "provider-not-found" }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "nope", modelId: "m" },
+      }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 400,
+      body: { error: "invalid_model_selection", message: "provider-not-found" },
+    });
+    expect(mock.createTask).not.toHaveBeenCalled();
+  });
+
+  it("create：model-not-found → 400 invalid_model_selection，不触达 createTask", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({ selectionIssue: "model-not-found" }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "p", modelId: "nope" },
+      }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 400,
+      body: { error: "invalid_model_selection", message: "model-not-found" },
+    });
+    expect(mock.createTask).not.toHaveBeenCalled();
+  });
+
+  it("create：reasoning-level-not-supported → 400 invalid_model_selection，不触达 createTask", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({ selectionIssue: "reasoning-level-not-supported" }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "p", modelId: "m", options: { reasoningLevel: "turbo" } },
+      }),
+    );
+
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 400,
+      body: { error: "invalid_model_selection", message: "reasoning-level-not-supported" },
+    });
+    expect(mock.createTask).not.toHaveBeenCalled();
+  });
+
+  it("create：无 issue → 透传 effectiveSelection（服务端归一后的选择，不用请求原值）", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({
+        effectiveSelection: {
+          providerId: "real-provider",
+          modelId: "m",
+          options: { reasoningLevel: "high" },
+        },
+      }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "account:plan-x", modelId: "m" },
+      }),
+    );
+
+    expect(mock.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelSelection: {
+          providerId: "real-provider",
+          modelId: "m",
+          options: { reasoningLevel: "high" },
+        },
+      }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201 });
+  });
+
+  it("create：模型服务缺失 → 原样透传（旧行为，不阻断建会话）", async () => {
+    const { responder, posted, mock } = createHarness(); // 缺省不注册 IModelSelectionService
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "create",
+        workspacePath: WORKSPACE,
+        prompt: "hi",
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(mock.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({ modelSelection: { providerId: "p", modelId: "m" } }),
+    );
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 201, body: { taskId: TASK_ID } });
+  });
+
+  it("setModel：reasoning-level-missing 补最高档后调 setModel，应答 200 {ok:true}", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({
+        providers: [
+          {
+            providerId: "p",
+            config: {},
+            models: [
+              { modelId: "m", config: { optionSpecs: { reasoningLevel: { values: ["low", "high"] } } } },
+            ],
+          },
+        ],
+        selectionIssue: "reasoning-level-missing",
+      }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "setModel",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        modelSelection: { providerId: "p", modelId: "m" },
+      }),
+    );
+
+    expect(mock.setModel).toHaveBeenCalledWith({
+      taskId: TASK_ID,
+      traceId: expect.stringMatching(UUID_RE),
+      modelSelection: { providerId: "p", modelId: "m", options: { reasoningLevel: "high" } },
+    });
+    expect(posted.at(-1)).toMatchObject({ ok: true, status: 200, body: { ok: true } });
+  });
+
+  it("setModel：provider-not-found → 归属校验在前（getTaskMeta 已调）、400 且不调 setModel", async () => {
+    const { responder, posted, mock } = createHarness({}, {
+      getView: async () => ({ selectionIssue: "provider-not-found" }),
+    });
+
+    await responder.handleRequest(
+      request("r1", {
+        kind: "setModel",
+        workspacePath: WORKSPACE,
+        taskId: TASK_ID,
+        modelSelection: { providerId: "nope", modelId: "m" },
+      }),
+    );
+
+    expect(mock.getTaskMeta).toHaveBeenCalledWith({ taskId: TASK_ID, workspacePath: WORKSPACE });
+    expect(mock.setModel).not.toHaveBeenCalled();
+    expect(posted.at(-1)).toMatchObject({
+      ok: true,
+      status: 400,
+      body: { error: "invalid_model_selection", message: "provider-not-found" },
+    });
   });
 });

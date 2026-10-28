@@ -6,6 +6,7 @@ import { IModelSelectionService, IZCodeTaskService, type ServiceCollection } fro
 import type {
   HostLocalTaskApiRequestMessage,
   HostLocalTaskApiResponseMessage,
+  ModelSelection,
 } from "@zcode/shared";
 
 /** 只依赖本 API 用到的任务服务面；签名随 IZCodeTaskService 演进。 */
@@ -59,6 +60,51 @@ interface TaskEventBuffer {
 
 export interface LocalTaskApiResponder {
   handleRequest(msg: HostLocalTaskApiRequestMessage): Promise<void>;
+}
+
+type ModelSelectionResolution =
+  | { ok: true; selection: ModelSelection }
+  | { ok: false; status: 400; body: { error: "invalid_model_selection"; message: string } };
+
+/** create/setModel 的模型选择预检与补齐（GUI 同源）：
+ * 1) getView({selection}) 让服务端解析——provider/model 不存在、账号态不可用、给了不支持的档位
+ *    → 400 invalid_model_selection（可判定的请求参数错误，不再落到 503）；
+ * 2) reasoning-level-missing → 按 GUI 新建对话同一默认补最高档（completeNewModelSelection 的
+ *    values.at(-1)，provider/src/model-selection-config.ts:58-73；GUI 调用先例
+ *    useDraftConfigControl.ts:545-557）；模型无档位可补时透传原样（CLI 对无档位模型不要求）；
+ * 3) 无 issue → 透传 effectiveSelection（服务端规范化，account-plan providerId 归一）。
+ * 模型服务缺失时不阻断：透传原样交由既有路径（CLI 侧报错按 503 表现）。 */
+async function resolveModelSelectionForOp(
+  modelSelectionService: Pick<IModelSelectionService, "getView"> | null,
+  selection: ModelSelection,
+): Promise<ModelSelectionResolution> {
+  if (!modelSelectionService) return { ok: true, selection };
+  const view = await modelSelectionService.getView({ selection });
+  const issue = view.selectionIssue;
+  if (
+    issue === "provider-not-found" ||
+    issue === "model-not-found" ||
+    issue === "account-connection-unavailable" ||
+    issue === "reasoning-level-not-supported"
+  ) {
+    return { ok: false, status: 400, body: { error: "invalid_model_selection", message: issue } };
+  }
+  if (issue === "reasoning-level-missing") {
+    // 账号档 providerId 已在服务端归一：按归一后的身份找候选；找不到回落请求原值。
+    const providerId = view.effectiveSelection?.providerId ?? selection.providerId;
+    const spec = view.providers
+      .find((p) => p.providerId === providerId)
+      ?.models.find((m) => m.modelId === selection.modelId)
+      ?.config.optionSpecs?.reasoningLevel; // 类型上必有、运行时可能缺：可选链是防御
+    const defaultLevel = spec?.values?.at(-1);
+    if (defaultLevel === undefined) return { ok: true, selection };
+    return {
+      ok: true,
+      selection: { ...selection, options: { ...selection.options, reasoningLevel: defaultLevel } },
+    };
+  }
+  // 无 issue 或 "selection-missing"（防御，op 侧必有选择）：透传服务端规范化结果。
+  return { ok: true, selection: view.effectiveSelection ?? selection };
 }
 
 export function createLocalTaskApiResponder(deps: {
@@ -236,12 +282,19 @@ export function createLocalTaskApiResponder(deps: {
     op: HostLocalTaskApiRequestMessage["op"],
   ): Promise<{ status: number; body: unknown }> {
     if (op.kind === "create") {
+      // 模型选择预检与补齐（GUI 同源默认档位）：可判定的参数错误按 400 拒绝，不落 503。
+      let modelSelection = op.modelSelection;
+      if (op.modelSelection) {
+        const resolved = await resolveModelSelectionForOp(modelSelectionService, op.modelSelection);
+        if (!resolved.ok) return { status: resolved.status, body: resolved.body };
+        modelSelection = resolved.selection;
+      }
       const created = await taskService.createTask({
         workspacePath: op.workspacePath,
         deferPersistenceUntilFirstPrompt: true,
         ...(op.mode ? { mode: op.mode } : {}),
-        // modelSelection 直接透传（IZCodeTaskService.createTask 正式字段；deprecated 的 model/thoughtLevel 不用）。
-        ...(op.modelSelection ? { modelSelection: op.modelSelection } : {}),
+        // modelSelection 透传预检/补齐后的选择（IZCodeTaskService.createTask 正式字段；deprecated 的 model/thoughtLevel 不用）。
+        ...(modelSelection ? { modelSelection } : {}),
       });
       // 订阅先行：首条 prompt 与 rename 的结果事件都要能进 buffer；失败不回滚 create，
       // 后续首次 events 调用会懒订阅兜底。
@@ -438,14 +491,22 @@ export function createLocalTaskApiResponder(deps: {
           providers: view.providers.map((provider) => ({
             providerId: provider.providerId,
             displayName: provider.providerName?.trim() || provider.providerId,
-            models: provider.models.map((model) => ({
-              modelId: model.modelId,
-              displayName: model.modelId,
+            models: provider.models.map((model) => {
               // optionSpecs 类型上必有（completeModelConfigDataSchema），可选链是配置解析缺口的防御。
-              thoughtLevels: model.config.optionSpecs?.reasoningLevel?.values ?? [],
-              isDefault:
-                preferred?.providerId === provider.providerId && preferred?.modelId === model.modelId,
-            })),
+              const thoughtLevels = model.config.optionSpecs?.reasoningLevel?.values ?? [];
+              const defaultThoughtLevel = thoughtLevels.at(-1);
+              return {
+                modelId: model.modelId,
+                displayName: model.modelId,
+                thoughtLevels,
+                // GUI 新建对话的默认档位同源：completeNewModelSelection 取 values.at(-1)（最高档）；
+                // 无档位模型（thoughtLevels 为空）不给该字段。
+                ...(defaultThoughtLevel !== undefined ? { defaultThoughtLevel } : {}),
+                isDefault:
+                  preferred?.providerId === provider.providerId &&
+                  preferred?.modelId === model.modelId,
+              };
+            }),
           })),
           ...(preferred ? { preferred } : {}),
         },
@@ -456,9 +517,12 @@ export function createLocalTaskApiResponder(deps: {
       // 归属校验：与 send/stop/events 同一模式（重锚定语义）。
       const meta = await taskService.getTaskMeta({ taskId: op.taskId, workspacePath: op.workspacePath });
       if (!meta) return { status: 404, body: { error: "task_not_found" } };
+      // 模型选择预检与补齐（GUI 同源默认档位）：归属校验在前，可判定的参数错误按 400 拒绝。
+      const resolved = await resolveModelSelectionForOp(modelSelectionService, op.modelSelection);
+      if (!resolved.ok) return { status: resolved.status, body: resolved.body };
       // 运行中允许换模型——与 GUI 一致（GUI 仅 Highspeed 卡激活时锁定，SessionPane.tsx 的
       // handleSelectModel；Highspeed 是 UI 运行态，Host 侧不可见，agent 侧拒绝时经外层 503 表现）。
-      await taskService.setModel({ taskId: op.taskId, traceId: newUUID(), modelSelection: op.modelSelection });
+      await taskService.setModel({ taskId: op.taskId, traceId: newUUID(), modelSelection: resolved.selection });
       return { status: 200, body: { ok: true } };
     }
 
